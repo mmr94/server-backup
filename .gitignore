@@ -1,0 +1,39 @@
+# ============================================================================
+#  Fichiers à NE JAMAIS committer — ce dépôt est public.
+# ============================================================================
+
+# Configuration réelle : contient FTP_HOST, FTP_USER et FTP_PASS en clair.
+# Seul backup.conf.example est versionné.
+backup.conf
+*.conf
+!backup.conf.example
+
+# Variantes d'environnement éventuelles
+.env
+.env.*
+!.env.example
+
+# Archives et fichiers de travail produits par le script
+*.tar
+*.tar.gz
+*.tar.zst
+*.tar.xz
+*.sha256
+*.part
+.build-*
+staging.*
+restore/
+
+# Journaux
+*.log
+*.log.*
+
+# Verrous
+*.lock
+*.lock.d/
+
+# Divers système
+.DS_Store
+Thumbs.db
+*~
+*.swp

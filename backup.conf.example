@@ -1,0 +1,294 @@
+# ============================================================================
+#  backup.conf — configuration du script de sauvegarde serveur -> FTP
+#  Copier en /etc/server-backup/backup.conf   (chmod 600, root:root)
+#  Toute variable ici peut aussi être passée par l'environnement.
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# 1. IDENTITÉ DU SERVEUR
+# ---------------------------------------------------------------------------
+# Sert à nommer les archives et le dossier distant. Un seul FTP peut donc
+# recevoir les backups de plusieurs serveurs sans collision.
+SERVER_NAME="prod-kehila-01"
+
+# ---------------------------------------------------------------------------
+# 2. CONNEXION FTP
+# ---------------------------------------------------------------------------
+FTP_HOST="ftp.exemple.com"
+FTP_PORT="21"
+FTP_USER="mon-user"
+FTP_PASS="mon-mot-de-passe"
+
+# Répertoire racine sur le FTP. Le script y crée <FTP_BASE_DIR>/<SERVER_NAME>/
+FTP_BASE_DIR="/backups"
+
+# Protocole :
+#   ftp      = FTP clair (À ÉVITER : mot de passe et données en clair sur le réseau)
+#   ftps     = FTP + TLS explicite (AUTH TLS) — recommandé si le FTP le supporte
+#   ftps-implicit = FTP + TLS implicite (port 990 en général)
+#   sftp     = SFTP sur SSH (le plus sûr ; utilise SFTP_KEY si défini, sinon FTP_PASS)
+FTP_PROTOCOL="ftps"
+
+# Vérifier le certificat TLS du serveur. Mettre "no" seulement si ton FTP a un
+# certificat auto-signé et que tu acceptes le risque de MITM.
+FTP_VERIFY_CERT="yes"
+
+# Clé privée SSH pour le mode sftp (laisser vide pour utiliser FTP_PASS)
+SFTP_KEY=""
+
+# ---------------------------------------------------------------------------
+# 3. QUOI SAUVEGARDER
+# ---------------------------------------------------------------------------
+# Chemins inclus dans l'archive. Un par ligne.
+# Les chemins inexistants sont ignorés avec un avertissement (pas une erreur) :
+# on peut donc garder une liste large et générique pour tous les serveurs.
+#
+# Cette liste vise le backup SYSTÈME : ce qu'il faut pour reconstruire une
+# machine identique. Les données applicatives volumineuses (bases, médias,
+# uploads clients) relèvent d'une sauvegarde dédiée.
+INCLUDE_PATHS="
+/etc
+/root
+/home
+/var/www
+/var/spool/cron
+/opt
+/srv
+/usr/local/bin
+/usr/local/etc
+/usr/local/sbin
+"
+
+# Chemins à ajouter à INCLUDE_PATHS si ce script doit AUSSI porter les données
+# (petit serveur sans sauvegarde dédiée) :
+#   /var/lib/docker/volumes   -> volumes Docker persistants
+#   /var/backups              -> dumps produits par d'autres outils
+# Sur un serveur dont les données sont déjà sauvegardées ailleurs, les laisser
+# en dehors évite de transférer des dizaines de Go inutilement à chaque passe.
+
+# Motifs exclus (syntaxe --exclude de tar : les jokers * ** sont acceptés).
+# Objectif : garder 100 % de la configuration, jeter tout ce qui est
+# volumineux, régénérable, ou purement éphémère.
+EXCLUDE_PATTERNS="
+/var/log
+/var/cache
+/var/tmp
+/var/run
+/var/lock
+/var/lib/docker/overlay2
+/var/lib/docker/containers/*/*-json.log
+/var/lib/mysql
+/var/lib/postgresql
+/var/lib/mongodb
+/var/lib/redis
+/var/lib/elasticsearch
+/var/lib/apt/lists
+/proc
+/sys
+/dev
+/run
+/tmp
+/mnt
+/media
+/lost+found
+/swapfile
+/swap.img
+*/node_modules
+*/.next/cache
+*/.nuxt
+*/vendor/bundle
+*/__pycache__
+*/.venv
+*/venv
+*/.git/objects/pack/*.pack
+*.log
+*.log.*
+*.gz.log
+*.sock
+*.pid
+*.core
+*.swp
+*.tmp
+*.iso
+*.img
+*.vmdk
+*.qcow2
+*/.cache
+*/.npm
+*/.yarn/cache
+*/.pnpm-store
+*/.cargo/registry
+*/.gradle
+*/.m2/repository
+"
+
+# Ne pas embarquer de fichier plus gros que cette taille (en Mo).
+# Protège contre un dump SQL de 40 Go oublié dans /var/www. 0 = pas de limite.
+MAX_FILE_SIZE_MB="512"
+
+# Ne pas traverser les autres systèmes de fichiers (NFS, disques de données,
+# montages réseau). Fortement recommandé.
+ONE_FILE_SYSTEM="yes"
+
+# ---------------------------------------------------------------------------
+# 4. PÉRIMÈTRE DES SECRETS  ⚠️ LE CHOIX LE PLUS STRUCTURANT DE CE FICHIER
+# ---------------------------------------------------------------------------
+# L'archive N'EST PAS CHIFFRÉE. Le choix porte donc sur ce qu'on accepte d'y
+# mettre, selon le niveau de confiance accordé à l'espace FTP.
+#
+# EXCLUDE_SECRETS="no"  (DÉFAUT — archive complète)
+#   L'archive contient tout, y compris /etc/shadow, les clés privées SSH et
+#   TLS, et les fichiers .env. C'est ce qui permet de restaurer un serveur
+#   intégralement, sans avoir à régénérer ni reconfigurer quoi que ce soit.
+#
+#   ⚠️ Conséquence à assumer : l'archive vaut un accès root. Qui peut lire une
+#   archive peut prendre le contrôle du serveur. Ce mode suppose donc que :
+#     - l'espace FTP est privé et maîtrisé (pas un hébergement mutualisé),
+#     - le mot de passe FTP n'est connu que de root, dans ce fichier en 600,
+#     - FTP_PROTOCOL vaut "ftps" ou "sftp" (sinon l'archive transite en clair),
+#     - la rétention du FTP est prise en compte : une vieille archive donne
+#       toujours accès aux clés qui n'ont pas été renouvelées depuis.
+#
+# EXCLUDE_SECRETS="yes"  (archive expurgée)
+#   Retire de l'archive :
+#     - /etc/shadow, /etc/gshadow (hashs de mots de passe)
+#     - les clés privées SSH (hôte et utilisateurs) ; authorized_keys est gardé
+#     - les clés privées TLS/SSL (/etc/ssl/private, Let's Encrypt, *.key, *.pem)
+#     - les .env, .my.cnf, .pgpass, .netrc, .npmrc, credentials AWS/GCP
+#     - les trousseaux GPG et les tokens d'API
+#   Un fichier _system-state/SECRETS-EXCLUS.txt liste alors TOUT ce qui a été
+#   retiré, chemin par chemin, avec la procédure pour le régénérer. Rien n'est
+#   perdu silencieusement, mais la restauration demande des étapes manuelles.
+#   À choisir si le FTP est mutualisé, partagé, ou hors de ton contrôle.
+EXCLUDE_SECRETS="no"
+
+# Motifs supplémentaires à traiter comme des secrets (un par ligne).
+# Utile pour les fichiers propres à tes projets.
+# ⚠️ Sans effet si EXCLUDE_SECRETS="no".
+EXTRA_SECRET_PATTERNS="
+*/config/master.key
+*/config/credentials/*.key
+*/storage/oauth-*.key
+*/.ssh/id_*
+*/secrets.yml
+*/secrets.yaml
+*/serviceAccount*.json
+"
+
+# Contrôle appliqué uniquement quand EXCLUDE_SECRETS="yes" : après
+# construction, le script scanne l'archive pour vérifier qu'aucun secret n'a
+# échappé aux motifs d'exclusion. "abort" annule la sauvegarde et supprime
+# l'archive, "warn" se contente d'avertir, "off" désactive le scan.
+# Ignoré en mode archive complète (les secrets y sont attendus).
+SECRET_SCAN_ACTION="warn"
+
+# ---------------------------------------------------------------------------
+# 5. MÉTADONNÉES SYSTÈME (le « 99 % » qui permet de vraiment redémarrer)
+# ---------------------------------------------------------------------------
+# Capture l'état du système dans un dossier _system-state/ inclus dans l'archive :
+# liste des paquets installés, services activés, règles de pare-feu, tables de
+# montage, crontabs, unités systemd, images/conteneurs Docker, users/groupes,
+# disposition des disques. C'est ce qui te permet de reconstruire un serveur
+# identique, pas seulement de récupérer des fichiers.
+CAPTURE_SYSTEM_STATE="yes"
+
+# ---------------------------------------------------------------------------
+# 6. DUMPS BASES DE DONNÉES  (optionnel — désactivé par défaut)
+# ---------------------------------------------------------------------------
+# Ce script est avant tout un backup SYSTÈME : configuration, services, sites,
+# état de la machine. Les données applicatives volumineuses (bases, médias,
+# uploads) relèvent normalement d'une sauvegarde dédiée, plus fréquente et
+# indépendante de celle-ci.
+#
+# Ces options restent disponibles pour les petits serveurs où tout tient dans
+# une seule sauvegarde et où monter une chaîne séparée n'aurait pas de sens :
+# il suffit alors de passer la variable voulue à "yes".
+#
+# Les répertoires de données SQL sont exclus plus haut (une copie à chaud de
+# /var/lib/mysql est corrompue). Ces dumps produisent des sauvegardes cohérentes.
+#
+# ⚠️ Un dump contient des données clients (emails, téléphones, hashs de mots de
+# passe applicatifs). Sur une archive non chiffrée, la protection repose
+# entièrement sur le contrôle d'accès au FTP — à prendre en compte au regard
+# du RGPD si la base contient des données personnelles.
+DUMP_MYSQL="no"
+MYSQL_DUMP_OPTS="--all-databases --single-transaction --quick --routines --triggers --events"
+# Laisser vide pour utiliser /root/.my.cnf (recommandé : pas de mot de passe ici)
+MYSQL_USER=""
+MYSQL_PASS=""
+
+DUMP_POSTGRES="no"
+POSTGRES_SUPERUSER="postgres"
+
+DUMP_MONGO="no"
+MONGO_URI="mongodb://127.0.0.1:27017"
+
+# Exclure les tables de comptes SQL (mysql.user, rôles PostgreSQL) des dumps.
+# Forcé à "no" quand EXCLUDE_SECRETS="no" : en archive complète, ces tables
+# sont nécessaires pour restaurer les utilisateurs et leurs droits.
+DUMP_SKIP_SENSITIVE_TABLES="yes"
+
+# ---------------------------------------------------------------------------
+# 7. RÉTENTION
+# ---------------------------------------------------------------------------
+# Deux stratégies, selon la place disponible sur le FTP.
+#
+# BACKUP_MODE="snapshot"  — UNE seule archive, écrasée à chaque exécution.
+#   Espace utilisé = taille d'une archive. Simple, prévisible.
+#   L'upload se fait sous un nom temporaire puis renommage : une coupure
+#   réseau ne détruit donc jamais l'archive précédente.
+#   ⚠️ Limite réelle : il n'y a aucun historique. Si le serveur est corrompu
+#   (ransomware, suppression accidentelle, bug applicatif) et qu'une
+#   sauvegarde tourne avant que tu t'en aperçoives, l'archive saine est
+#   écrasée par une archive du serveur déjà cassé. Un cron quotidien laisse
+#   donc moins de 24 h pour réagir.
+#
+# BACKUP_MODE="history"   — archives datées + rotation grand-père/père/fils.
+#   Protège contre le cas ci-dessus : une corruption non détectée pendant
+#   plusieurs jours reste récupérable via une archive antérieure.
+#   Espace utilisé ≈ (KEEP_DAILY + KEEP_WEEKLY + KEEP_MONTHLY + KEEP_YEARLY)
+#   × taille d'une archive. Avec les valeurs par défaut : ~19 archives.
+#   Pour une archive de 100 Go, cela représente ~1,9 To — à ajuster.
+BACKUP_MODE="snapshot"
+
+# Nombre d'archives conservées sur le FTP, par catégorie.
+# Utilisé uniquement si BACKUP_MODE="history".
+KEEP_DAILY="7"
+KEEP_WEEKLY="4"     # archive du dimanche
+KEEP_MONTHLY="6"    # archive du 1er du mois
+KEEP_YEARLY="2"     # archive du 1er janvier
+
+# Copies locales gardées sur le serveur (0 = supprimer après upload).
+KEEP_LOCAL="1"
+
+# ---------------------------------------------------------------------------
+# 8. DIVERS
+# ---------------------------------------------------------------------------
+# Dossier de travail. Doit avoir au moins la taille de l'archive en libre.
+WORK_DIR="/var/backups/server-backup"
+
+# Fichier de log du script (rotation automatique au-delà de 5 Mo).
+LOG_FILE="/var/log/server-backup.log"
+
+# Niveau de compression zstd (1-19) ou gzip (1-9). zstd est utilisé s'il est
+# installé — bien plus rapide à compression égale.
+COMPRESSION_LEVEL="10"
+
+# Limite de bande passante d'upload en Ko/s (0 = illimité). Utile pour ne pas
+# saturer la connexion du serveur en pleine journée.
+BANDWIDTH_LIMIT_KB="0"
+
+# Timeout global du script en secondes (0 = illimité). Empêche deux exécutions
+# cron de se marcher dessus indéfiniment.
+TIMEOUT_SECONDS="10800"
+
+# ---------------------------------------------------------------------------
+# 9. NOTIFICATIONS (optionnel)
+# ---------------------------------------------------------------------------
+# Webhook appelé en cas d'échec — et de succès si NOTIFY_ON_SUCCESS=yes.
+# Compatible Slack / Mattermost / Discord (ajouter /slack à l'URL Discord).
+NOTIFY_WEBHOOK=""
+NOTIFY_ON_SUCCESS="no"
+
+# Adresse mail de secours (nécessite `mail` ou `sendmail` sur le serveur).
+NOTIFY_EMAIL=""
