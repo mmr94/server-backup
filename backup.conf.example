@@ -193,41 +193,66 @@ SECRET_SCAN_ACTION="warn"
 CAPTURE_SYSTEM_STATE="yes"
 
 # ---------------------------------------------------------------------------
-# 6. DUMPS BASES DE DONNÉES  (optionnel — désactivé par défaut)
+# 6. HOOKS — préparer ou nettoyer autour de la sauvegarde
 # ---------------------------------------------------------------------------
-# Ce script est avant tout un backup SYSTÈME : configuration, services, sites,
-# état de la machine. Les données applicatives volumineuses (bases, médias,
-# uploads) relèvent normalement d'une sauvegarde dédiée, plus fréquente et
-# indépendante de celle-ci.
+# Ce script ne connaît aucun moteur de base de données, et c'est volontaire :
+# tout ce qui doit être préparé avant l'archivage se met dans un script à toi.
 #
-# Ces options restent disponibles pour les petits serveurs où tout tient dans
-# une seule sauvegarde et où monter une chaîne séparée n'aurait pas de sens :
-# il suffit alors de passer la variable voulue à "yes".
+#   before_backup.sh   exécuté avant l'archivage, s'il existe
+#   after_backup.sh    exécuté après, y compris en cas d'échec
 #
-# Les répertoires de données SQL sont exclus plus haut (une copie à chaud de
-# /var/lib/mysql est corrompue). Ces dumps produisent des sauvegardes cohérentes.
+# Par défaut, ils sont cherchés À CÔTÉ DE CE FICHIER de configuration. Sur un
+# serveur, la config vit en /etc/server-backup/ tandis que le script est
+# souvent dans un dépôt git : les scripts propres à la machine n'ont rien à
+# faire dans le dépôt.
 #
-# ⚠️ Un dump contient des données clients (emails, téléphones, hashs de mots de
-# passe applicatifs). Sur une archive non chiffrée, la protection repose
-# entièrement sur le contrôle d'accès au FTP — à prendre en compte au regard
-# du RGPD si la base contient des données personnelles.
-DUMP_MYSQL="no"
-MYSQL_DUMP_OPTS="--all-databases --single-transaction --quick --routines --triggers --events"
-# Laisser vide pour utiliser /root/.my.cnf (recommandé : pas de mot de passe ici)
-MYSQL_USER=""
-MYSQL_PASS=""
+# Rendre le hook exécutable, sinon il est ignoré avec un avertissement :
+#     chmod 750 /etc/server-backup/before_backup.sh
+#
+# Variables disponibles dans le hook :
+#   BACKUP_STAGING_DIR   dossier dont le contenu est INCLUS dans l'archive.
+#                        Y écrire suffit : rien à déclarer ailleurs.
+#   BACKUP_SERVER_NAME   nom du serveur
+#   BACKUP_WORK_DIR      répertoire de travail
+#   BACKUP_MODE_NAME     snapshot | history
+#   BACKUP_DRY_RUN       yes | no
+#   BACKUP_ARCHIVE_PATH  (after seulement) chemin de l'archive produite
+#   BACKUP_STATUS        (after seulement) success | failure
+#
+# Exemple de before_backup.sh — dumps SQL et MongoDB :
+#
+#     #!/usr/bin/env bash
+#     set -euo pipefail
+#     # Ne rien dumper pour une simple simulation.
+#     [ "$BACKUP_DRY_RUN" = "yes" ] && exit 0
+#
+#     mkdir -p "$BACKUP_STAGING_DIR/_databases"
+#
+#     # MySQL : --single-transaction pour un dump cohérent sans verrouiller.
+#     # Les identifiants passent par /root/.my.cnf, jamais en ligne de commande.
+#     mysqldump --all-databases --single-transaction --quick \
+#               --routines --triggers --events \
+#       > "$BACKUP_STAGING_DIR/_databases/mysql.sql"
+#
+#     # PostgreSQL
+#     su - postgres -c pg_dumpall > "$BACKUP_STAGING_DIR/_databases/postgres.sql"
+#
+#     # MongoDB
+#     mongodump --uri="mongodb://127.0.0.1:27017" \
+#               --archive="$BACKUP_STAGING_DIR/_databases/mongo.archive"
+#
+# Chemins explicites si tu veux les placer ailleurs (sinon laisser vide) :
+BEFORE_HOOK=""
+AFTER_HOOK=""
 
-DUMP_POSTGRES="no"
-POSTGRES_SUPERUSER="postgres"
-
-DUMP_MONGO="no"
-MONGO_URI="mongodb://127.0.0.1:27017"
-
-# Exclure les tables de comptes SQL (mysql.user, rôles PostgreSQL) des dumps.
-# Forcé à "no" quand EXCLUDE_SECRETS="no" : en archive complète, ces tables
-# sont nécessaires pour restaurer les utilisateurs et leurs droits.
-DUMP_SKIP_SENSITIVE_TABLES="yes"
-
+# Que faire si before_backup.sh échoue ?
+#   abort = annuler la sauvegarde (défaut). Un dump raté passé sous silence
+#           produirait une archive incomplète qu'on croirait valide — c'est
+#           le jour de la restauration qu'on s'en apercevrait.
+#   warn  = signaler et continuer malgré tout.
+# after_backup.sh est toujours traité en "warn" : son échec ne peut pas
+# invalider une archive déjà envoyée et vérifiée.
+HOOK_FAILURE="abort"
 # ---------------------------------------------------------------------------
 # 7. RÉTENTION
 # ---------------------------------------------------------------------------

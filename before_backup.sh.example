@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  before_backup.sh — exécuté par server-backup.sh AVANT l'archivage
+#
+#  Installation :
+#      cp before_backup.sh.example /etc/server-backup/before_backup.sh
+#      chmod 750 /etc/server-backup/before_backup.sh
+#      $EDITOR /etc/server-backup/before_backup.sh
+#
+#  Tout ce qui est écrit dans $BACKUP_STAGING_DIR entre dans l'archive.
+#  Aucune déclaration n'est nécessaire dans backup.conf.
+#
+#  Variables fournies par le script appelant :
+#      BACKUP_STAGING_DIR   dossier inclus dans l'archive (écrire ici)
+#      BACKUP_SERVER_NAME   nom du serveur
+#      BACKUP_WORK_DIR      répertoire de travail
+#      BACKUP_MODE_NAME     snapshot | history
+#      BACKUP_DRY_RUN       yes | no
+#
+#  Si ce script sort en erreur, la sauvegarde est annulée par défaut
+#  (HOOK_FAILURE="abort"). C'est voulu : une archive amputée d'un dump raté
+#  est pire qu'une absence de sauvegarde, parce qu'on la croit valide.
+# ============================================================================
+
+set -euo pipefail
+
+# En simulation, ne rien produire : inutile de dumper 40 Go pour un --dry-run.
+[ "${BACKUP_DRY_RUN:-no}" = "yes" ] && exit 0
+
+DUMPS="${BACKUP_STAGING_DIR}/_databases"
+mkdir -p "${DUMPS}"
+chmod 700 "${DUMPS}"
+
+log() { printf '%s\n' "$*"; }
+
+# ---------------------------------------------------------------------------
+# MySQL / MariaDB
+# ---------------------------------------------------------------------------
+# Les identifiants passent par /root/.my.cnf plutôt que par la ligne de
+# commande, qui serait lisible dans `ps` par tout utilisateur :
+#     [client]
+#     user=root
+#     password=...
+#
+# --single-transaction produit un dump cohérent sans verrouiller les tables
+# (InnoDB). Sur du MyISAM, il faut --lock-tables à la place.
+if command -v mysqldump >/dev/null 2>&1; then
+  log "Dump MySQL…"
+  mysqldump --all-databases --single-transaction --quick \
+            --routines --triggers --events \
+    > "${DUMPS}/mysql-all.sql"
+  log "  $(du -h "${DUMPS}/mysql-all.sql" | cut -f1)"
+fi
+
+# ---------------------------------------------------------------------------
+# PostgreSQL
+# ---------------------------------------------------------------------------
+# pg_dumpall doit tourner en tant que superutilisateur postgres.
+# Ajouter --no-role-passwords pour exclure les hashs des rôles.
+if command -v pg_dumpall >/dev/null 2>&1; then
+  log "Dump PostgreSQL…"
+  su - postgres -c pg_dumpall > "${DUMPS}/postgres-all.sql"
+  log "  $(du -h "${DUMPS}/postgres-all.sql" | cut -f1)"
+fi
+
+# ---------------------------------------------------------------------------
+# MongoDB
+# ---------------------------------------------------------------------------
+# --archive produit un fichier unique, plus simple à restaurer qu'un dossier :
+#     mongorestore --archive=mongo.archive
+if command -v mongodump >/dev/null 2>&1; then
+  log "Dump MongoDB…"
+  mongodump --uri="mongodb://127.0.0.1:27017" \
+            --archive="${DUMPS}/mongo.archive" --quiet
+  log "  $(du -h "${DUMPS}/mongo.archive" | cut -f1)"
+fi
+
+# ---------------------------------------------------------------------------
+# Autres exemples utiles
+# ---------------------------------------------------------------------------
+
+# Redis : forcer une sauvegarde disque avant de copier le dump.
+# if command -v redis-cli >/dev/null 2>&1; then
+#   redis-cli BGSAVE >/dev/null
+#   sleep 5
+#   cp /var/lib/redis/dump.rdb "${DUMPS}/redis.rdb"
+# fi
+
+# Liste des images Docker, pour les retrouver après restauration.
+# if command -v docker >/dev/null 2>&1; then
+#   docker images --format '{{.Repository}}:{{.Tag}}' > "${DUMPS}/docker-images.txt"
+# fi
+
+# Copie cohérente d'une application qui n'aime pas être lue à chaud :
+# arrêter le service le temps du snapshot, et le relancer quoi qu'il arrive.
+# systemctl stop mon-app
+# trap 'systemctl start mon-app' EXIT
+# cp -a /var/lib/mon-app "${BACKUP_STAGING_DIR}/mon-app"
+
+# Certificats, licences ou tout fichier hors des chemins habituels.
+# cp -a /opt/licences "${BACKUP_STAGING_DIR}/licences"
+
+log "Préparation terminée."

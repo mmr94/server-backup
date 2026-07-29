@@ -25,7 +25,50 @@ L'archive part ensuite sur le FTP, sous un nom temporaire renommé une fois le t
 
 Ce script sauvegarde **le système**, pas les données applicatives volumineuses. Les bases de données et les fichiers utilisateurs relèvent d'une sauvegarde dédiée, plus fréquente.
 
-Des dumps SQL (MySQL, PostgreSQL, MongoDB) restent disponibles et désactivés par défaut, pour les petits serveurs où tout tient dans une seule sauvegarde.
+Pour tout ce qui doit être préparé avant l'archivage — dumps SQL, exports, arrêt d'un service le temps d'une copie cohérente — voir les hooks ci-dessous.
+
+---
+
+## Hooks
+
+Le script ne connaît aucun moteur de base de données, et c'est délibéré : il exécute un script à toi et archive ce qu'il produit.
+
+Dépose un `before_backup.sh` à côté de `backup.conf` :
+
+```bash
+cp before_backup.sh.example /etc/server-backup/before_backup.sh
+chmod 750 /etc/server-backup/before_backup.sh
+```
+
+Tout ce qu'il écrit dans `$BACKUP_STAGING_DIR` entre dans l'archive — sous n'importe quel nom de dossier, sans rien déclarer dans la configuration.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$BACKUP_DRY_RUN" = "yes" ] && exit 0
+
+mkdir -p "$BACKUP_STAGING_DIR/_databases"
+mysqldump --all-databases --single-transaction --quick \
+  > "$BACKUP_STAGING_DIR/_databases/mysql.sql"
+mongodump --uri="mongodb://127.0.0.1:27017" \
+  --archive="$BACKUP_STAGING_DIR/_databases/mongo.archive"
+```
+
+| Variable | Contenu |
+|---|---|
+| `BACKUP_STAGING_DIR` | Dossier inclus dans l'archive — écrire ici |
+| `BACKUP_SERVER_NAME` | Nom du serveur |
+| `BACKUP_WORK_DIR` | Répertoire de travail |
+| `BACKUP_MODE_NAME` | `snapshot` ou `history` |
+| `BACKUP_DRY_RUN` | `yes` / `no` — un hook correct ne dumpe rien en simulation |
+| `BACKUP_ARCHIVE_PATH` | *(after seulement)* chemin de l'archive produite |
+| `BACKUP_STATUS` | *(after seulement)* `success` / `failure` |
+
+Un `after_backup.sh` est exécuté à la fin, **y compris quand la sauvegarde échoue** — utile pour purger des dumps ou alerter.
+
+Si `before_backup.sh` échoue, la sauvegarde est annulée (`HOOK_FAILURE="abort"`, code `7`) et l'archive précédente reste intacte sur le FTP. Une archive amputée d'un dump raté est pire qu'une absence de sauvegarde : on la croit valide jusqu'au jour de la restauration. Passer à `warn` pour continuer malgré tout.
+
+Lancé en root, le script refuse d'exécuter un hook modifiable par tous — ce serait une porte d'entrée directe vers un accès root.
 
 ---
 
@@ -87,6 +130,7 @@ Le script cherche sa configuration dans cet ordre :
 | `EXCLUDE_PATTERNS` | Ce qui est écarté : logs, caches, `node_modules`, données SQL brutes |
 | `EXCLUDE_SECRETS` | Voir « Modèle de sécurité » ci-dessous |
 | `BACKUP_MODE` | `snapshot` (une archive) ou `history` (rotation) |
+| `HOOK_FAILURE` | `abort` (défaut) ou `warn` si `before_backup.sh` échoue |
 | `MAX_FILE_SIZE_MB` | Filet contre un dump de 40 Go oublié dans `/var/www` |
 
 Un même fichier de configuration convient à plusieurs serveurs : les chemins inexistants sont signalés puis ignorés, jamais fatals.
@@ -220,6 +264,7 @@ Le lanceur démarre un serveur FTP jetable sur `127.0.0.1:2121`, exécute la sui
 | `4` | Échec du transfert |
 | `5` | Une sauvegarde est déjà en cours |
 | `6` | Secret détecté dans une archive censée être expurgée |
+| `7` | Échec de `before_backup.sh` |
 
 ---
 

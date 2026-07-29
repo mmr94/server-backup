@@ -8,6 +8,12 @@ backup.conf
 *.conf
 !backup.conf.example
 
+# Hooks : propres à chaque machine, et susceptibles de contenir des
+# identifiants de base de données. Seuls les exemples sont versionnés.
+before_backup.sh
+after_backup.sh
+!*.example
+
 # Variantes d'environnement éventuelles
 .env
 .env.*

@@ -43,7 +43,7 @@
 #
 #  Codes de sortie : 0 OK · 1 erreur de config · 2 prérequis manquant
 #                    3 échec archivage · 4 échec upload · 5 déjà en cours
-#                    6 secret détecté dans l'archive
+#                    6 secret détecté dans l'archive · 7 échec d'un hook
 # ============================================================================
 
 set -Eeuo pipefail
@@ -84,11 +84,9 @@ EXCLUDE_SECRETS="no"
 EXTRA_SECRET_PATTERNS=""
 SECRET_SCAN_ACTION="warn"
 CAPTURE_SYSTEM_STATE="yes"
-DUMP_MYSQL="no" ; MYSQL_DUMP_OPTS="--all-databases --single-transaction --quick --routines --triggers --events"
-MYSQL_USER="" ; MYSQL_PASS=""
-DUMP_POSTGRES="no" ; POSTGRES_SUPERUSER="postgres"
-DUMP_MONGO="no" ; MONGO_URI="mongodb://127.0.0.1:27017"
-DUMP_SKIP_SENSITIVE_TABLES="yes"
+# Hooks : chemins par défaut, à côté du fichier de configuration.
+# Résolus après le chargement de la config (voir resolve_hooks).
+BEFORE_HOOK="" ; AFTER_HOOK="" ; HOOK_FAILURE="abort" ; HOOK_STATUS=""
 BACKUP_MODE="snapshot"
 KEEP_DAILY="7" ; KEEP_WEEKLY="4" ; KEEP_MONTHLY="6" ; KEEP_YEARLY="2" ; KEEP_LOCAL="1"
 WORK_DIR="/var/backups/server-backup"
@@ -237,6 +235,16 @@ log_step()  { _log "STEP " "${C_DIM}" "── $* ──"; }
 die() {
   local code="${2:-1}"
   log_error "$1"
+
+  # after_backup.sh doit aussi tourner quand la sauvegarde échoue : c'est là
+  # qu'on purge les dumps temporaires ou qu'on alerte. La garde évite une
+  # récursion si le hook lui-même provoque un die().
+  if [[ "${MODE}" == "backup" && -z "${_IN_DIE:-}" && -n "${AFTER_HOOK:-}" && -f "${AFTER_HOOK}" ]]; then
+    _IN_DIE=1
+    HOOK_FAILURE="warn"
+    run_after_hook "failure" || true
+  fi
+
   notify "failure" "$1"
   exit "${code}"
 }
@@ -300,6 +308,17 @@ load_config() {
   # refait sur le nouveau chemin.
   LOG_WRITABLE="unknown"
   log_info "Configuration chargée depuis ${CONFIG_FILE}"
+  resolve_hooks
+}
+
+resolve_hooks() {
+  # Les hooks vivent à côté du fichier de configuration : sur un serveur, la
+  # config est en /etc/server-backup/ tandis que le script est souvent dans un
+  # dépôt git — les scripts propres à la machine n'ont rien à y faire.
+  # Une valeur explicite dans backup.conf reste prioritaire.
+  local conf_dir ; conf_dir="$(cd "$(dirname "${CONFIG_FILE}")" && pwd)"
+  [[ -z "${BEFORE_HOOK}" ]] && BEFORE_HOOK="${conf_dir}/before_backup.sh"
+  [[ -z "${AFTER_HOOK}"  ]] && AFTER_HOOK="${conf_dir}/after_backup.sh"
 }
 
 validate_config() {
@@ -337,6 +356,11 @@ validate_config() {
   case "${SECRET_SCAN_ACTION}" in
     abort|warn|off) ;;
     *) log_error "SECRET_SCAN_ACTION invalide : '${SECRET_SCAN_ACTION}' (attendu : abort|warn|off)"; ((errors++)) ;;
+  esac
+
+  case "${HOOK_FAILURE}" in
+    abort|warn) ;;
+    *) log_error "HOOK_FAILURE invalide : '${HOOK_FAILURE}' (attendu : abort|warn)"; ((errors++)) ;;
   esac
 
   case "${BACKUP_MODE}" in
@@ -864,85 +888,108 @@ capture_system_state() {
 }
 
 # ============================================================================
-#  Dumps bases de données
-#  Copier /var/lib/mysql à chaud produit une base corrompue : on exclut ces
-#  répertoires et on fait des dumps cohérents à la place.
+#  Hooks — before_backup.sh / after_backup.sh
+#
+#  Le script ne connaît aucun moteur de base de données. Tout ce qui doit être
+#  préparé avant l'archivage (dumps SQL, export de conteneurs, arrêt d'un
+#  service le temps d'une copie cohérente) se met dans un script à côté du
+#  fichier de configuration. Il est exécuté s'il existe, ignoré sinon.
+#
+#  Variables exposées au hook :
+#    BACKUP_STAGING_DIR   dossier dont le contenu est INCLUS dans l'archive.
+#                         Écrire ses dumps ici suffit : rien à déclarer dans
+#                         la configuration.
+#    BACKUP_SERVER_NAME   nom du serveur tel que configuré
+#    BACKUP_WORK_DIR      répertoire de travail du script
+#    BACKUP_MODE_NAME     snapshot | history
+#    BACKUP_DRY_RUN       yes | no  — un hook bien écrit ne modifie rien en
+#                         dry-run (ne pas dumper 40 Go pour une simulation)
+#    BACKUP_ARCHIVE_PATH  (after_backup uniquement) chemin de l'archive créée
+#    BACKUP_STATUS        (after_backup uniquement) success | failure
+#
+#  Exemple de before_backup.sh :
+#      #!/usr/bin/env bash
+#      set -euo pipefail
+#      [ "$BACKUP_DRY_RUN" = "yes" ] && exit 0
+#      mkdir -p "$BACKUP_STAGING_DIR/_databases"
+#      mysqldump --all-databases --single-transaction --quick \
+#        > "$BACKUP_STAGING_DIR/_databases/mysql.sql"
+#      mongodump --uri="mongodb://127.0.0.1:27017" \
+#        --archive="$BACKUP_STAGING_DIR/_databases/mongo.archive"
 # ============================================================================
-dump_databases() {
-  local d="${STAGING_DIR}/_databases"
+run_hook() {
+  local phase="$1"          # before | after
+  local script="${2}"
+  local label="${phase}_backup.sh"
 
-  # Un dump contient des données clients en clair (emails, téléphones). Sur un
-  # FTP non chiffré, la protection repose entièrement sur l'accès au FTP.
-  if [[ "${DUMP_MYSQL}" == "yes" || "${DUMP_POSTGRES}" == "yes" || "${DUMP_MONGO}" == "yes" ]]; then
-    log_info "Dumps SQL activés : données applicatives incluses en clair dans l'archive."
+  [[ -f "${script}" ]] || { log_info "Aucun ${label} — étape ignorée."; return 0; }
+
+  if [[ ! -x "${script}" ]]; then
+    log_warn "${label} trouvé mais non exécutable — corrige avec : chmod +x ${script}"
+    [[ "${HOOK_FAILURE}" == "abort" ]] && die "Hook non exécutable : ${script}" 7
+    return 0
   fi
 
-  # En archive complète, on garde les tables de comptes SQL : sans elles, les
-  # utilisateurs et leurs droits sont à recréer à la main après restauration.
-  local skip_sensitive="${DUMP_SKIP_SENSITIVE_TABLES}"
-  [[ "${EXCLUDE_SECRETS}" != "yes" ]] && skip_sensitive="no"
-
-  if [[ "${DUMP_MYSQL}" == "yes" ]]; then
-    log_step "Dump MySQL / MariaDB"
-    if have mysqldump; then
-      mkdir -p "${d}"
-      local -a auth=()
-      [[ -n "${MYSQL_USER}" ]] && auth+=("--user=${MYSQL_USER}")
-      [[ -n "${MYSQL_PASS}" ]] && auth+=("--password=${MYSQL_PASS}")
-      local -a skip=()
-      if [[ "${skip_sensitive}" == "yes" ]]; then
-        # La table mysql.user contient les hashs de mots de passe SQL.
-        skip+=(--ignore-table=mysql.user --ignore-table=mysql.global_priv)
-      fi
-      # shellcheck disable=SC2086
-      if mysqldump "${auth[@]+"${auth[@]}"}" "${skip[@]+"${skip[@]}"}" ${MYSQL_DUMP_OPTS} >"${d}/mysql-all.sql" 2>"${d}/mysql-error.log"; then
-        log_ok "Dump MySQL : $(du -h "${d}/mysql-all.sql" | cut -f1)"
-        rm -f "${d}/mysql-error.log"
-      else
-        log_warn "Dump MySQL échoué — voir _databases/mysql-error.log dans l'archive."
-      fi
-    else
-      log_warn "DUMP_MYSQL=yes mais 'mysqldump' est introuvable."
+  # Un hook lancé par root exécutant un fichier modifiable par tous est une
+  # porte d'entrée directe vers un accès root. On refuse.
+  if [[ "${EUID}" -eq 0 ]]; then
+    local perms owner
+    perms="$(stat -c '%a' "${script}" 2>/dev/null || stat -f '%Lp' "${script}" 2>/dev/null || echo '')"
+    owner="$(stat -c '%u' "${script}" 2>/dev/null || stat -f '%u' "${script}" 2>/dev/null || echo '')"
+    if [[ -n "${perms}" && "${perms}" =~ [2367]$ ]]; then
+      die "${label} est modifiable par tous (mode ${perms}) et serait exécuté en root. Corrige : chmod 750 ${script}" 7
+    fi
+    if [[ -n "${owner}" && "${owner}" != "0" ]]; then
+      log_warn "${label} n'appartient pas à root (uid ${owner}) alors qu'il sera exécuté en root."
     fi
   fi
 
-  if [[ "${DUMP_POSTGRES}" == "yes" ]]; then
-    log_step "Dump PostgreSQL"
-    if have pg_dumpall; then
-      mkdir -p "${d}"
-      local pg_opts=""
-      # --no-role-passwords retire les hashs des rôles du dump.
-      [[ "${skip_sensitive}" == "yes" ]] && pg_opts="--no-role-passwords"
-      # pg_dumpall doit tourner en tant que superutilisateur postgres.
-      if su - "${POSTGRES_SUPERUSER}" -c "pg_dumpall ${pg_opts}" >"${d}/postgres-all.sql" 2>"${d}/postgres-error.log"; then
-        log_ok "Dump PostgreSQL : $(du -h "${d}/postgres-all.sql" | cut -f1)"
-        rm -f "${d}/postgres-error.log"
-      else
-        log_warn "Dump PostgreSQL échoué — voir _databases/postgres-error.log."
-      fi
-    else
-      log_warn "DUMP_POSTGRES=yes mais 'pg_dumpall' est introuvable."
+  log_step "Exécution de ${label}"
+  local started ; started="$(date +%s)"
+  local rc=0
+
+  # La sortie passe par un fichier plutôt que par un pipe : avec
+  # `hook | while read`, le code de retour observé est celui du `while`, et le
+  # `|| rc=$?` ne voit jamais l'échec du hook. Un dump raté serait alors traité
+  # comme un succès — exactement ce que HOOK_FAILURE="abort" doit empêcher.
+  local hook_out="${STAGING_DIR:-${WORK_DIR}}/_hook-${phase}.out"
+
+  # Le hook hérite d'un environnement explicite : il n'a pas à relire la
+  # configuration ni à deviner où écrire.
+  BACKUP_STAGING_DIR="${STAGING_DIR}" \
+  BACKUP_SERVER_NAME="${SERVER_NAME}" \
+  BACKUP_WORK_DIR="${WORK_DIR}" \
+  BACKUP_MODE_NAME="${BACKUP_MODE}" \
+  BACKUP_DRY_RUN="${DRY_RUN}" \
+  BACKUP_ARCHIVE_PATH="${ARCHIVE_PATH:-}" \
+  BACKUP_STATUS="${HOOK_STATUS:-}" \
+    "${script}" >"${hook_out}" 2>&1 || rc=$?
+
+  # Sortie du hook reprise dans le log principal, décalée pour rester lisible.
+  if [[ -s "${hook_out}" ]]; then
+    while IFS= read -r line; do
+      printf '%s   │ %s%s\n' "${C_DIM}" "${line}" "${C_OFF}" >&2
+      [[ "${LOG_WRITABLE:-no}" == "yes" ]] && printf '   │ %s\n' "${line}" >>"${LOG_FILE}" 2>/dev/null
+    done <"${hook_out}"
+  fi
+  rm -f -- "${hook_out}"
+
+  local elapsed=$(( $(date +%s) - started ))
+
+  if (( rc != 0 )); then
+    if [[ "${HOOK_FAILURE}" == "abort" ]]; then
+      die "${label} a échoué (code ${rc}) — sauvegarde annulée. Une archive amputée d'un dump raté serait pire qu'une absence de sauvegarde." 7
     fi
+    log_warn "${label} a échoué (code ${rc}) — la sauvegarde continue (HOOK_FAILURE=warn)."
+    return 0
   fi
 
-  if [[ "${DUMP_MONGO}" == "yes" ]]; then
-    log_step "Dump MongoDB"
-    if have mongodump; then
-      mkdir -p "${d}/mongo"
-      if mongodump --uri="${MONGO_URI}" --out="${d}/mongo" >"${d}/mongo-dump.log" 2>&1; then
-        log_ok "Dump MongoDB : $(du -sh "${d}/mongo" | cut -f1)"
-      else
-        log_warn "Dump MongoDB échoué — voir _databases/mongo-dump.log."
-      fi
-      # L'URI peut contenir des identifiants : elle ne doit pas rester en clair.
-      sed -i -E 's#(mongodb(\+srv)?://)[^@ ]*@#\1<<REDACTED>>@#g' "${d}/mongo-dump.log" 2>/dev/null || true
-    else
-      log_warn "DUMP_MONGO=yes mais 'mongodump' est introuvable."
-    fi
-  fi
-
+  log_ok "${label} terminé en ${elapsed}s."
   return 0
 }
+
+run_before_hook() { run_hook "before" "${BEFORE_HOOK}"; }
+run_after_hook()  { HOOK_STATUS="$1" ; run_hook "after" "${AFTER_HOOK}"; }
 
 # ============================================================================
 #  Construction de l'archive
@@ -974,10 +1021,21 @@ build_archive() {
     fi
   done <<<"${INCLUDE_PATHS}"
 
-  # Les données générées (état système, dumps) sont ajoutées depuis le staging.
+  # Tout ce qui se trouve dans le staging entre dans l'archive : l'état système
+  # capturé, mais aussi ce que before_backup.sh y a déposé, sous n'importe quel
+  # nom. Une liste codée en dur ferait disparaître en silence les dumps d'un
+  # hook qui aurait choisi un autre répertoire.
   local -a staging_includes=()
-  [[ -d "${STAGING_DIR}/_system-state" ]] && staging_includes+=("_system-state")
-  [[ -d "${STAGING_DIR}/_databases"    ]] && staging_includes+=("_databases")
+  local entry
+  for entry in "${STAGING_DIR}"/*; do
+    [[ -e "${entry}" ]] || continue
+    local bn ; bn="$(basename "${entry}")"
+    # Fichiers de travail internes : ils n'ont rien à faire dans l'archive.
+    case "${bn}" in
+      _toobig.txt|_listing.txt|_verify-listing.txt|_tar-stderr.txt|.netrc) continue ;;
+    esac
+    staging_includes+=("${bn}")
+  done
 
   if (( ${#includes[@]} == 0 && ${#staging_includes[@]} == 0 )); then
     die "Aucun chemin à sauvegarder : vérifie INCLUDE_PATHS dans ${CONFIG_FILE}." 3
@@ -1762,9 +1820,12 @@ do_backup() {
   STAGING_DIR="$(mktemp -d "${WORK_DIR}/staging.XXXXXX")"
   chmod 700 "${STAGING_DIR}"
 
+  # Le hook tourne AVANT la capture d'état : ce qu'il écrit dans le staging
+  # (dumps SQL, exports) fait partie de l'archive au même titre que le reste.
+  run_before_hook
+
   capture_system_state
   write_secrets_manifest
-  dump_databases
   build_archive
   verify_archive
   scan_archive_for_secrets
@@ -1782,6 +1843,15 @@ do_backup() {
   fi
 
   log_ok "═══ Sauvegarde ${summary} ═══"
+
+  # Le hook de sortie tourne avant la notification : il peut encore purger des
+  # dumps ou remonter une information. Son échec n'invalide pas une sauvegarde
+  # déjà envoyée et vérifiée — on le signale sans annuler.
+  local saved_hook_failure="${HOOK_FAILURE}"
+  HOOK_FAILURE="warn"
+  run_after_hook "success"
+  HOOK_FAILURE="${saved_hook_failure}"
+
   notify "success" "${summary}"
 }
 
@@ -1819,6 +1889,14 @@ MODÈLE DE SÉCURITÉ
   Dans les deux cas, préfère FTP_PROTOCOL="ftps" ou "sftp" : en FTP clair,
   archive et mot de passe circulent en clair sur le réseau.
 
+HOOKS
+  Deposer un before_backup.sh a cote du fichier de configuration (chmod 750)
+  pour tout ce qui doit etre prepare avant l'archivage : dumps SQL, exports,
+  arret d'un service le temps d'une copie coherente. Ce qu'il ecrit dans
+  $BACKUP_STAGING_DIR entre dans l'archive, sans rien declarer ailleurs.
+  Un after_backup.sh est execute a la fin, y compris en cas d'echec.
+  Voir before_backup.sh.example.
+
 CONFIGURATION
   Recherchée dans l'ordre :
 EOF
@@ -1838,6 +1916,7 @@ EOF
 CODES DE SORTIE
   0 succès · 1 config · 2 prérequis · 3 archivage · 4 upload
   5 déjà en cours · 6 secret détecté dans une archive
+  7 echec de before_backup.sh
 EOF
 }
 

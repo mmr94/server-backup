@@ -309,6 +309,93 @@ grep -q 'sftp:connect-program' "$SCRIPT" && ok "sftp: clé privée prise en comp
 grep -q 'ssl:verify-certificate' "$SCRIPT" && ok "vérification du certificat configurable" || ko "certificat non vérifié"
 grep -q 'StrictHostKeyChecking' "$SCRIPT" && ok "sftp: contrôle de l'hôte SSH" || ko "sftp: hôte non contrôlé"
 
+# ============================================== 9d. Hooks
+head2 "9d. Hooks before_backup / after_backup"
+setup_srv; clean_ftp hooks
+HK="$S/hookconf"; rm -rf "$HK"; mkdir -p "$HK"
+cat > "$HK/backup.conf" <<CONF
+SERVER_NAME="hooks"
+FTP_HOST="127.0.0.1"; FTP_PORT="2121"; FTP_USER="testuser"; FTP_PASS="testpass"
+FTP_PROTOCOL="ftp"; FTP_BASE_DIR="/backups"
+INCLUDE_PATHS="
+$SRV/etc
+"
+WORK_DIR="$SRV/work"; LOG_FILE="$S/t_hooks.log"; TIMEOUT_SECONDS="0"
+ONE_FILE_SYSTEM="no"; BACKUP_MODE="snapshot"; CAPTURE_SYSTEM_STATE="no"
+CONF
+chmod 600 "$HK/backup.conf"
+
+# --- hook qui réussit et produit des fichiers ---
+cat > "$HK/before_backup.sh" <<'HOOK'
+#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$BACKUP_STAGING_DIR/_databases" "$BACKUP_STAGING_DIR/perso"
+echo "dump" > "$BACKUP_STAGING_DIR/_databases/db.sql"
+echo "libre" > "$BACKUP_STAGING_DIR/perso/x.txt"
+echo "hook-ok serveur=$BACKUP_SERVER_NAME"
+HOOK
+chmod 750 "$HK/before_backup.sh"
+OUT=$(bash "$SCRIPT" --config "$HK/backup.conf" 2>&1)
+grep -q 'hook-ok serveur=hooks' <<<"$OUT" && ok "hook exécuté, variables transmises" || ko "hook non exécuté"
+A=$(arch_of hooks)
+if [ -n "$A" ]; then
+  L=$(lst "$A")
+  grep -q '_databases/db.sql' <<<"$L" && ok "fichiers du hook inclus dans l'archive" || ko "fichiers du hook absents"
+  grep -q 'perso/x.txt' <<<"$L" && ok "dossier au nom libre inclus" || ko "dossier au nom libre ignoré"
+else ko "hooks: pas d'archive"; fi
+
+# --- hook en échec : la sauvegarde doit être annulée ---
+cat > "$HK/before_backup.sh" <<'HOOK'
+#!/usr/bin/env bash
+echo "dump impossible" >&2
+exit 1
+HOOK
+chmod 750 "$HK/before_backup.sh"
+clean_ftp hooks
+OUT=$(bash "$SCRIPT" --config "$HK/backup.conf" 2>&1); RC=$?
+[ "$RC" = "7" ] && ok "hook en échec: code 7" || ko "hook en échec: code $RC (7 attendu)"
+[ -z "$(arch_of hooks)" ] && ok "hook en échec: aucune archive envoyée" || ko "archive envoyée malgré l'échec du hook"
+
+# --- HOOK_FAILURE=warn : doit continuer ---
+echo 'HOOK_FAILURE="warn"' >> "$HK/backup.conf"
+clean_ftp hooks
+OUT=$(bash "$SCRIPT" --config "$HK/backup.conf" 2>&1)
+[ -n "$(arch_of hooks)" ] && ok "HOOK_FAILURE=warn: sauvegarde poursuivie" || ko "HOOK_FAILURE=warn: sauvegarde bloquée"
+sed -i'' -e 's/^HOOK_FAILURE=.*/HOOK_FAILURE="abort"/' "$HK/backup.conf" 2>/dev/null
+
+# --- hook non exécutable : averti, non fatal ---
+cat > "$HK/before_backup.sh" <<'HOOK'
+#!/usr/bin/env bash
+exit 0
+HOOK
+chmod 640 "$HK/before_backup.sh"
+OUT=$(bash "$SCRIPT" --config "$HK/backup.conf" 2>&1)
+grep -q 'non exécutable' <<<"$OUT" && ok "hook non exécutable signalé" || ko "hook non exécutable silencieux"
+chmod 750 "$HK/before_backup.sh"
+
+# --- after_backup reçoit le statut, y compris sur échec ---
+cat > "$HK/after_backup.sh" <<'HOOK'
+#!/usr/bin/env bash
+echo "after-statut=${BACKUP_STATUS}"
+HOOK
+chmod 750 "$HK/after_backup.sh"
+OUT=$(bash "$SCRIPT" --config "$HK/backup.conf" 2>&1)
+grep -q 'after-statut=success' <<<"$OUT" && ok "after_backup: statut success transmis" || ko "after_backup: statut absent"
+
+cat > "$HK/before_backup.sh" <<'HOOK'
+#!/usr/bin/env bash
+exit 1
+HOOK
+chmod 750 "$HK/before_backup.sh"
+OUT=$(bash "$SCRIPT" --config "$HK/backup.conf" 2>&1)
+grep -q 'after-statut=failure' <<<"$OUT" && ok "after_backup exécuté malgré l'échec" || ko "after_backup ignoré sur échec"
+
+# --- absence de hook : silencieux, non bloquant ---
+rm -f "$HK/before_backup.sh" "$HK/after_backup.sh"
+clean_ftp hooks
+OUT=$(bash "$SCRIPT" --config "$HK/backup.conf" 2>&1)
+[ -n "$(arch_of hooks)" ] && ok "absence de hook: sauvegarde normale" || ko "absence de hook: sauvegarde bloquée"
+
 # ============================================== 9c. Chemins particuliers
 head2 "9c. Chemins avec espaces et caractères spéciaux"
 rm -rf "$S/space"; mkdir -p "$S/space/mon dossier/etc" "$S/space/work"
