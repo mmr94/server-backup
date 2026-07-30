@@ -195,7 +195,19 @@ Vérifie les prérequis, la configuration, la connexion FTP, et affiche la taill
 ```bash
 ./server-backup.sh --list
 ```
-Liste les archives présentes sur le FTP avec leur catégorie de rétention.
+Liste les archives présentes sur le FTP — nom, taille, date, catégorie de rétention, et total occupé :
+
+```
+  ARCHIVE                                    TAILLE  DATE              RÉTENTION
+  ────────────────────────────────────────────────────────────────────────────────
+  prod_2026-01-01_030000.tar.zst             673 Ko  2026-01-01 03:00  yearly
+  prod_2026-07-26_030000.tar.zst             1,0 Mo  2026-07-26 03:00  weekly
+  prod_2026-07-30_030000.tar.zst             1,4 Mo  2026-07-30 03:00  daily
+
+  3 archive(s) — 3,1 Mo au total sur le FTP.
+```
+
+Les tailles nécessitent `lftp` ; avec `curl`, seuls les noms sont disponibles.
 
 ```bash
 ./server-backup.sh --restore nom-archive.tar.zst

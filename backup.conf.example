@@ -69,6 +69,15 @@ INCLUDE_PATHS="
 # Motifs exclus (syntaxe --exclude de tar : les jokers * ** sont acceptés).
 # Objectif : garder 100 % de la configuration, jeter tout ce qui est
 # volumineux, régénérable, ou purement éphémère.
+#
+# Les deux formes sont acceptées : un motif absolu ("/var/log") comme relatif
+# ("var/log") fonctionne. tar stocke ses membres sans le "/" initial, donc le
+# script ajoute automatiquement la forme complémentaire — sans quoi une
+# exclusion absolue échouerait en silence et l'archive gonflerait sans le
+# moindre message d'erreur.
+#
+# Un motif ne s'applique qu'à ce qui est réellement sous INCLUDE_PATHS :
+# exclure "/var/lib/mysql" est sans effet si "/var/lib" n'est pas sauvegardé.
 EXCLUDE_PATTERNS="
 /var/log
 /var/cache

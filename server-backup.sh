@@ -51,6 +51,10 @@ IFS=$'\n\t'
 
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Chemin absolu : le script se relance lui-même sous `timeout`, qui résout la
+# commande via PATH. Un ${BASH_SOURCE[0]} relatif (./server-backup.sh) échoue
+# alors avec "No such file or directory".
+readonly SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
 readonly SCRIPT_VERSION="1.0.0"
 # Non readonly : acquire_lock() se replie sur WORK_DIR si /var/lock est absent.
 LOCK_FILE="/var/lock/server-backup.lock"
@@ -323,18 +327,18 @@ resolve_hooks() {
 
 validate_config() {
   local errors=0
-  [[ -n "${FTP_HOST}" ]] || { log_error "FTP_HOST est vide."; ((errors++)); }
-  [[ -n "${FTP_USER}" ]] || { log_error "FTP_USER est vide."; ((errors++)); }
+  [[ -n "${FTP_HOST}" ]] || { log_error "FTP_HOST est vide."; errors=$((errors+1)); }
+  [[ -n "${FTP_USER}" ]] || { log_error "FTP_USER est vide."; errors=$((errors+1)); }
 
   if [[ "${FTP_PROTOCOL}" == "sftp" && -n "${SFTP_KEY}" ]]; then
-    [[ -r "${SFTP_KEY}" ]] || { log_error "Clé SSH introuvable : ${SFTP_KEY}"; ((errors++)); }
+    [[ -r "${SFTP_KEY}" ]] || { log_error "Clé SSH introuvable : ${SFTP_KEY}"; errors=$((errors+1)); }
   elif [[ -z "${FTP_PASS}" ]]; then
-    log_error "FTP_PASS est vide (et aucune clé SFTP fournie)."; ((errors++))
+    log_error "FTP_PASS est vide (et aucune clé SFTP fournie)."; errors=$((errors+1))
   fi
 
   case "${FTP_PROTOCOL}" in
     ftp|ftps|ftps-implicit|sftp) ;;
-    *) log_error "FTP_PROTOCOL invalide : '${FTP_PROTOCOL}' (attendu : ftp|ftps|ftps-implicit|sftp)"; ((errors++)) ;;
+    *) log_error "FTP_PROTOCOL invalide : '${FTP_PROTOCOL}' (attendu : ftp|ftps|ftps-implicit|sftp)"; errors=$((errors+1)) ;;
   esac
 
   # L'archive n'étant pas chiffrée, le transport en clair est le second maillon
@@ -355,12 +359,12 @@ validate_config() {
 
   case "${SECRET_SCAN_ACTION}" in
     abort|warn|off) ;;
-    *) log_error "SECRET_SCAN_ACTION invalide : '${SECRET_SCAN_ACTION}' (attendu : abort|warn|off)"; ((errors++)) ;;
+    *) log_error "SECRET_SCAN_ACTION invalide : '${SECRET_SCAN_ACTION}' (attendu : abort|warn|off)"; errors=$((errors+1)) ;;
   esac
 
   case "${HOOK_FAILURE}" in
     abort|warn) ;;
-    *) log_error "HOOK_FAILURE invalide : '${HOOK_FAILURE}' (attendu : abort|warn)"; ((errors++)) ;;
+    *) log_error "HOOK_FAILURE invalide : '${HOOK_FAILURE}' (attendu : abort|warn)"; errors=$((errors+1)) ;;
   esac
 
   case "${BACKUP_MODE}" in
@@ -374,7 +378,7 @@ validate_config() {
       local total=$(( KEEP_DAILY + KEEP_WEEKLY + KEEP_MONTHLY + KEEP_YEARLY ))
       log_info "Mode history : jusqu'à ${total} archives conservées sur le FTP."
       ;;
-    *) log_error "BACKUP_MODE invalide : '${BACKUP_MODE}' (attendu : snapshot|history)"; ((errors++)) ;;
+    *) log_error "BACKUP_MODE invalide : '${BACKUP_MODE}' (attendu : snapshot|history)"; errors=$((errors+1)) ;;
   esac
 
   # Une valeur non numérique ici ferait planter les calculs de rotation.
@@ -382,7 +386,7 @@ validate_config() {
   for var in KEEP_DAILY KEEP_WEEKLY KEEP_MONTHLY KEEP_YEARLY KEEP_LOCAL \
              MAX_FILE_SIZE_MB COMPRESSION_LEVEL BANDWIDTH_LIMIT_KB TIMEOUT_SECONDS; do
     if ! [[ "${!var}" =~ ^[0-9]+$ ]]; then
-      log_error "${var} doit être un entier (valeur : '${!var}')"; ((errors++))
+      log_error "${var} doit être un entier (valeur : '${!var}')"; errors=$((errors+1))
     fi
   done
 
@@ -394,6 +398,18 @@ validate_config() {
 #  Prérequis
 # ============================================================================
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Octets -> unité lisible. `numfmt` est GNU-only, on calcule à la main pour
+# rester utilisable sur BSD/macOS comme sur Linux.
+human_size() {
+  local b="${1:-0}"
+  if ! [[ "${b}" =~ ^[0-9]+$ ]]; then printf '?' ; return 0 ; fi
+  if   (( b >= 1073741824 )); then printf '%d,%01d Go' $(( b / 1073741824 )) $(( (b % 1073741824) * 10 / 1073741824 ))
+  elif (( b >= 1048576 ));    then printf '%d,%01d Mo' $(( b / 1048576 ))    $(( (b % 1048576) * 10 / 1048576 ))
+  elif (( b >= 1024 ));       then printf '%d Ko' $(( b / 1024 ))
+  else                             printf '%d o' "${b}"
+  fi
+}
 
 # mapfile est apparu avec bash 4. La cible normale de ce script (Linux serveur)
 # en dispose, mais bash 3.2 est encore livré par défaut sur macOS et sur
@@ -419,7 +435,7 @@ fi
 check_prerequisites() {
   local missing=0
 
-  have tar || { log_error "'tar' est requis."; ((missing++)); }
+  have tar || { log_error "'tar' est requis."; missing=$((missing+1)); }
 
   # zstd est bien plus rapide que gzip à taux de compression comparable.
   if have zstd; then
@@ -431,7 +447,7 @@ check_prerequisites() {
     COMPRESSOR="gzip" ; ARCHIVE_EXT="tar.gz"
     (( COMPRESSION_LEVEL > 9 )) && COMPRESSION_LEVEL=9
   else
-    log_error "Aucun compresseur trouvé (zstd, pigz ou gzip)."; ((missing++))
+    log_error "Aucun compresseur trouvé (zstd, pigz ou gzip)."; missing=$((missing+1))
   fi
 
   # lftp gère nativement FTPS, SFTP, la reprise et la suppression distante.
@@ -440,9 +456,9 @@ check_prerequisites() {
   elif have curl; then
     TRANSFER_TOOL="curl"
     log_warn "'lftp' absent : bascule sur curl. La rotation des archives distantes sera désactivée."
-    [[ "${FTP_PROTOCOL}" == "sftp" ]] && { log_error "Le mode sftp nécessite lftp."; ((missing++)); }
+    [[ "${FTP_PROTOCOL}" == "sftp" ]] && { log_error "Le mode sftp nécessite lftp."; missing=$((missing+1)); }
   else
-    log_error "Ni 'lftp' ni 'curl' n'est installé — impossible d'uploader."; ((missing++))
+    log_error "Ni 'lftp' ni 'curl' n'est installé — impossible d'uploader."; missing=$((missing+1))
   fi
 
   if (( missing > 0 )); then
@@ -648,7 +664,7 @@ HEADER
       local meta
       meta="$(stat -c '%A %U:%G %s octets' "${f}" 2>/dev/null || echo '')"
       printf '  %-58s %s\n' "${f}" "${meta}" >>"${out}"
-      ((count++))
+      count=$((count+1))
     done
   done
 
@@ -1081,6 +1097,15 @@ build_archive() {
     pat="$(echo "${pat}" | xargs)"
     [[ -z "${pat}" || "${pat}" == \#* ]] && continue
     tar_opts+=(--exclude="${pat}")
+    # tar stocke ses membres sans le "/" initial : un motif absolu comme
+    # "/var/log" ne matche donc JAMAIS, et l'exclusion échoue en silence —
+    # l'archive gonfle sans le moindre message. On ajoute systématiquement la
+    # forme complémentaire, comme pour les motifs de secrets plus bas.
+    if [[ "${pat}" == /* ]]; then
+      tar_opts+=(--exclude="${pat#/}")
+    else
+      tar_opts+=(--exclude="/${pat}")
+    fi
   done <<<"${EXCLUDE_PATTERNS}"
 
   # --- Exclusion des secrets ---
@@ -1090,7 +1115,14 @@ build_archive() {
     for pat in "${SECRET_PATTERNS[@]}"; do
       tar_opts+=(--exclude="${pat}")
       # Un motif relatif doit aussi matcher en absolu et inversement.
-      [[ "${pat}" == /* ]] && tar_opts+=(--exclude="${pat#/}") || tar_opts+=(--exclude="/${pat}")
+      # if/else plutôt que `&& ... || ...` : dans cette dernière forme, le ||
+      # s'exécute aussi quand la branche && échoue, ce qui ajouterait les deux
+      # variantes.
+      if [[ "${pat}" == /* ]]; then
+        tar_opts+=(--exclude="${pat#/}")
+      else
+        tar_opts+=(--exclude="/${pat}")
+      fi
     done
     log_info "${#SECRET_PATTERNS[@]} motif(s) de secrets exclu(s) de l'archive."
   fi
@@ -1659,7 +1691,7 @@ do_check() {
     if [[ -e "${p}" ]]; then
       local size ; size="$(du -sh "${p}" 2>/dev/null | cut -f1 || echo '?')"
       printf '  %s %-32s %s\n' "${C_GRN}✓${C_OFF}" "${p}" "${size}" >&2
-      ((total++))
+      total=$((total+1))
     else
       printf '  %s %-32s %s\n' "${C_YEL}✗${C_OFF}" "${p}" "absent" >&2
     fi
@@ -1680,17 +1712,75 @@ do_check() {
 do_list() {
   check_prerequisites
   log_step "Archives présentes sur ${FTP_HOST}$(remote_dir)"
+
   local -a arr=()
   mapfile -t arr < <(list_remote_archives)
   if (( ${#arr[@]} == 0 )); then
-    log_warn "Aucune archive trouvée."
+    log_warn "Aucune archive trouvée dans $(remote_dir)."
+    log_info "Vérifie SERVER_NAME et FTP_BASE_DIR, ou lance une première sauvegarde."
     return 0
   fi
-  local a
+
+  # Taille et date viennent d'un listing long : sans elles, impossible de voir
+  # d'un coup d'œil qu'une archive a fondu ou que la dernière date d'un mois.
+  local details=""
+  if [[ "${TRANSFER_TOOL}" == "lftp" ]]; then
+    details="$(run_lftp "cd $(remote_dir); cls -l --date --size; exit" 2>/dev/null || true)"
+  fi
+
+  local a tier size date_col line total_bytes=0
+  printf '\n  %-46s %10s  %-16s %s\n' "ARCHIVE" "TAILLE" "DATE" "RÉTENTION" >&2
+  printf '  %s\n' "$(printf '─%.0s' $(seq 1 88))" >&2
+
   for a in "${arr[@]}"; do
-    printf '  %-52s [%s]\n' "${a}" "$(archive_tier "${a}")" >&2
+    tier="$(archive_tier "${a}")"
+    # Réinitialisées à chaque tour : sans cela, une archive absente du listing
+    # long hériterait de la taille et de la date de la précédente.
+    size="?" ; date_col="" ; line=""
+
+    if [[ -n "${details}" ]]; then
+      # La ligne de `cls -l` se termine par le nom du fichier ; on en extrait
+      # la taille (champ numérique) et la date affichée par le serveur.
+      line="$(grep -F " ${a}" <<<"${details}" | head -1 || true)"
+      if [[ -n "${line}" ]]; then
+        # Format d'un listing FTP (style ls -l) :
+        #   perms  liens  uid  gid  TAILLE  mois  jour  heure  nom
+        # Les champs sont comptés depuis la FIN, car le nom est toujours le
+        # dernier : chercher "le premier nombre > 100" attrapait l'UID.
+        local bytes
+        bytes="$(awk '{print $(NF-4)}' <<<"${line}" 2>/dev/null || true)"
+        if [[ "${bytes}" =~ ^[0-9]+$ ]]; then
+          total_bytes=$(( total_bytes + bytes ))
+          size="$(human_size "${bytes}")"
+        fi
+      fi
+    fi
+
+    # Date tirée du NOM de l'archive, pas de l'horodatage FTP : ce dernier
+    # correspond à l'upload et se décale au moindre re-transfert. En mode
+    # snapshot le nom est fixe ("_latest"), on retombe alors sur la date du
+    # serveur, seule information disponible.
+    if [[ "${a}" =~ ([0-9]{4}-[0-9]{2}-[0-9]{2})_([0-9]{2})([0-9]{2}) ]]; then
+      date_col="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}:${BASH_REMATCH[3]}"
+    elif [[ -n "${line}" ]]; then
+      date_col="$(awk '{print $(NF-3), $(NF-2), $(NF-1)}' <<<"${line}" 2>/dev/null || true)"
+    fi
+
+    printf '  %-46s %10s  %-16s %s\n' "${a}" "${size}" "${date_col}" "${tier}" >&2
   done
-  log_ok "${#arr[@]} archive(s)."
+
+  printf '\n' >&2
+  if (( total_bytes > 0 )); then
+    log_ok "${#arr[@]} archive(s) — $(human_size "${total_bytes}") au total sur le FTP."
+  else
+    log_ok "${#arr[@]} archive(s)."
+  fi
+
+  # Sans lftp, la taille n'est pas récupérable : le dire plutôt que d'afficher
+  # des "?" sans explication.
+  [[ "${TRANSFER_TOOL}" != "lftp" ]] && \
+    log_info "Tailles indisponibles sans lftp (curl ne fournit qu'un listing de noms)."
+  return 0
 }
 
 do_restore() {
@@ -1761,7 +1851,7 @@ do_restore() {
 
 do_install_cron() {
   local target="/etc/cron.d/server-backup"
-  local script_path="${SCRIPT_DIR}/${SCRIPT_NAME}"
+  local script_path="${SCRIPT_PATH}"
 
   [[ "${EUID}" -eq 0 ]] || die "L'installation du cron nécessite root." 1
 
@@ -1959,9 +2049,18 @@ main() {
     # de processus et un SIGTERM reçu de l'extérieur (kill, arrêt système) ne
     # lui parvient jamais. Le trap de nettoyage ne s'exécuterait pas et le
     # verrou survivrait, bloquant toutes les sauvegardes suivantes.
+    # Les arguments sont construits dans un TABLEAU, jamais par expansion de
+    # chaîne. Avec `${CONFIG_FILE:+--config "${CONFIG_FILE}"}`, les guillemets
+    # internes empêchent le découpage en mots — et IFS=$'\n\t' retire de toute
+    # façon l'espace des séparateurs : l'ensemble arrivait comme un unique
+    # argument "--config /chemin", que le parseur rejetait. Un tableau élimine
+    # le problème à la racine et gère les chemins contenant des espaces.
+    local -a relaunch=("${SCRIPT_PATH}")
+    [[ -n "${CONFIG_FILE}" ]] && relaunch+=(--config "${CONFIG_FILE}")
+    [[ "${DRY_RUN}" == "yes" ]] && relaunch+=(--dry-run)
+
     exec timeout --foreground --signal=TERM --kill-after=60 "${TIMEOUT_SECONDS}" \
-      "${BASH_SOURCE[0]}" ${CONFIG_FILE:+--config "${CONFIG_FILE}"} \
-      $([[ "${DRY_RUN}" == "yes" ]] && echo --dry-run)
+      "${relaunch[@]}"
   fi
 
   case "${MODE}" in

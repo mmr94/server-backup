@@ -418,6 +418,109 @@ if [ -n "$A" ]; then
   lst "$A" | grep -q 'app.conf' && ok "chemin contenant des espaces archivé" || ko "chemin avec espaces perdu"
 else ko "chemin avec espaces: aucune archive"; fi
 
+# ============================================== 9e. Régressions de production
+head2 "9e. Bugs remontés en production"
+
+# --- Exclusions par chemin ABSOLU ---
+# tar stocke ses membres sans le "/" initial : un motif "/var/log" ne matchait
+# jamais et l'exclusion échouait en silence (archive de 612 Mo au lieu de 178).
+rm -rf "$S/excl"; mkdir -p "$S/excl/srv/var/log" "$S/excl/srv/var/www" "$S/excl/work"
+head -c 2000000 /dev/zero > "$S/excl/srv/var/log/gros.dat"
+echo "site" > "$S/excl/srv/var/www/index.php"
+cat > "$S/t_excl.conf" <<CONF
+SERVER_NAME="excl"
+FTP_HOST="127.0.0.1"; FTP_PORT="2121"; FTP_USER="testuser"; FTP_PASS="testpass"
+FTP_PROTOCOL="ftp"; FTP_BASE_DIR="/backups"
+INCLUDE_PATHS="
+$S/excl/srv/var
+"
+EXCLUDE_PATTERNS="
+$S/excl/srv/var/log
+"
+WORK_DIR="$S/excl/work"; LOG_FILE="$S/t_excl.log"; TIMEOUT_SECONDS="0"
+ONE_FILE_SYSTEM="no"; CAPTURE_SYSTEM_STATE="no"; BACKUP_MODE="snapshot"
+CONF
+chmod 600 "$S/t_excl.conf"
+clean_ftp excl
+run excl >/dev/null 2>&1
+A=$(arch_of excl)
+if [ -n "$A" ]; then
+  lst "$A" | grep -q 'gros.dat' && ko "exclusion par chemin absolu inopérante" \
+                                || ok "exclusion par chemin absolu appliquée"
+  lst "$A" | grep -q 'index.php' && ok "exclusion absolue n'exclut pas trop" \
+                                 || ko "exclusion absolue a tout supprimé"
+else ko "exclusions: pas d'archive"; fi
+
+# --- ((var++)) sous set -e ---
+# `((total++))` renvoie 1 quand la variable vaut 0 : avec set -e, --check et
+# --list s'interrompaient au premier élément listé.
+grep -qE '\(\([a-zA-Z_]+\+\+\)\)' "$SCRIPT" \
+  && ko "((var++)) présent : interrompt le script sous set -e" \
+  || ok "aucun ((var++)) sous set -e"
+
+setup_srv; mkconf chk
+OUT=$(run chk --check 2>&1); RC=$?
+grep -q 'Vérification terminée' <<<"$OUT" && ok "--check va jusqu'au bout" || ko "--check interrompu"
+[ "$RC" = "0" ] && ok "--check: code 0" || ko "--check: code $RC"
+
+# --- Re-exec sous timeout ---
+# Les guillemets internes de ${CONFIG_FILE:+--config "..."} empêchaient le
+# découpage en mots : l'ensemble arrivait comme un seul argument.
+# Hors commentaires : le code documente précisément le motif fautif.
+grep -vE '^\s*#' "$SCRIPT" | grep -qE '\$\{CONFIG_FILE:\+--config' \
+  && ko "re-exec: expansion de chaîne au lieu d'un tableau" \
+  || ok "re-exec: arguments construits en tableau"
+grep -q 'exec timeout' "$SCRIPT" && grep -q 'SCRIPT_PATH' "$SCRIPT" \
+  && ok "re-exec: chemin absolu du script" || ko "re-exec: chemin relatif (timeout ne le trouve pas)"
+
+# Simulation du re-exec réel : `timeout` doit relancer le script correctement.
+if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
+  rm -rf "$S/tmo"; mkdir -p "$S/tmo/bin" "$S/tmo/srv/etc" "$S/tmo/work"
+  echo "cfg" > "$S/tmo/srv/etc/a.conf"
+  if ! command -v timeout >/dev/null 2>&1; then
+    printf '#!/bin/sh\nexec %s "$@"\n' "$(command -v gtimeout)" > "$S/tmo/bin/timeout"
+    chmod +x "$S/tmo/bin/timeout"
+  fi
+  cat > "$S/t_tmo.conf" <<CONF
+SERVER_NAME="tmo"
+FTP_HOST="127.0.0.1"; FTP_PORT="2121"; FTP_USER="testuser"; FTP_PASS="testpass"
+FTP_PROTOCOL="ftp"; FTP_BASE_DIR="/backups"
+INCLUDE_PATHS="
+$S/tmo/srv/etc
+"
+WORK_DIR="$S/tmo/work"; LOG_FILE="$S/t_tmo.log"
+TIMEOUT_SECONDS="600"
+ONE_FILE_SYSTEM="no"; CAPTURE_SYSTEM_STATE="no"; BACKUP_MODE="snapshot"
+CONF
+  chmod 600 "$S/t_tmo.conf"
+  clean_ftp tmo
+  OUT=$(PATH="$S/tmo/bin:$PATH" bash "$SCRIPT" --config "$S/t_tmo.conf" 2>&1)
+  grep -qE 'Option inconnue|No such file' <<<"$OUT" && ko "re-exec sous timeout: arguments cassés" \
+    || ok "re-exec sous timeout: arguments transmis"
+  [ -n "$(arch_of tmo)" ] && ok "sauvegarde aboutit avec TIMEOUT_SECONDS>0" \
+                          || ko "sauvegarde échoue quand timeout est actif"
+else
+  ok "re-exec sous timeout: non testable (timeout absent)"
+fi
+
+# ============================================== 9f. Commande --list
+head2 "9f. Listing des archives"
+clean_ftp lsx; mkdir -p "$FTPROOT/backups/lsx"
+for d in 2026-07-30_030000 2026-07-26_030000 2026-07-01_030000 2026-01-01_030000; do
+  head -c 300000 /dev/urandom > "$FTPROOT/backups/lsx/lsx_${d}.tar.zst"
+done
+mkconf lsx
+OUT=$(run lsx --list 2>&1)
+grep -q 'ARCHIVE' <<<"$OUT" && ok "--list: en-tête de tableau" || ko "--list: pas de tableau"
+grep -qE '[0-9]+ Ko|[0-9],[0-9] Mo' <<<"$OUT" && ok "--list: tailles affichées" || ko "--list: tailles absentes"
+grep -q '2026-01-01 03:00' <<<"$OUT" && ok "--list: date tirée du nom d'archive" || ko "--list: date absente"
+grep -q 'yearly' <<<"$OUT" && ok "--list: catégorie de rétention" || ko "--list: catégorie absente"
+grep -qE '4 archive\(s\) —' <<<"$OUT" && ok "--list: total cumulé" || ko "--list: total absent"
+
+clean_ftp vide; mkconf vide
+OUT=$(run vide --list 2>&1)
+grep -q 'Aucune archive' <<<"$OUT" && ok "--list: absence d'archive signalée" || ko "--list: silence sur dossier vide"
+
 # ============================================== 10. Espace disque
 head2 "10. Contrôle de l'espace disque"
 setup_srv; clean_ftp space; mkconf space
