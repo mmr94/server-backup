@@ -65,6 +65,7 @@ class BackupFTPIntegrationTests(unittest.TestCase):
             'FTP_USER': 'fixture', 'FTP_PASS': 'fixture-only-password', 'FTP_PROTOCOL': 'ftp',
             'FTP_BASE_DIR': '/backups', 'INCLUDE_PATHS': str(self.source), 'EXCLUDE_PATTERNS': '*.log',
             'WORK_DIR': str(self.work), 'LOG_FILE': str(self.root / 'backup.log'),
+            'LOCK_FILE': str(self.work / 'backup.lock'),
             'CAPTURE_SYSTEM_STATE': 'no', 'EXCLUDE_SECRETS': 'no', 'BACKUP_MODE': 'history',
             'TIMEOUT_SECONDS': '0', 'ONE_FILE_SYSTEM': 'no', 'FTP_QUOTA_BYTES': '10000000',
             'FTP_RESERVE_BYTES': '1000', 'BACKUP_VERIFY_REMOTE': 'yes', 'KEEP_LOCAL': '1',

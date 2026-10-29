@@ -45,6 +45,7 @@ EXCLUDE_PATTERNS="
 *.log
 "
 WORK_DIR="$SRV/work"
+LOCK_FILE="\${WORK_DIR}/server-backup.lock"
 LOG_FILE="$S/t_${name}.log"
 TIMEOUT_SECONDS="0"
 ONE_FILE_SYSTEM="no"
@@ -180,6 +181,7 @@ EXCLUDE_PATTERNS="
 */tsrv/etc
 "
 WORK_DIR="$SRV/work"; LOG_FILE="$S/t_brk.log"; TIMEOUT_SECONDS="0"
+LOCK_FILE="\${WORK_DIR}/server-backup.lock"
 ONE_FILE_SYSTEM="no"; BACKUP_MODE="snapshot"
 CONF
 chmod 600 "$S/t_brk.conf"
@@ -321,6 +323,7 @@ INCLUDE_PATHS="
 $SRV/etc
 "
 WORK_DIR="$SRV/work"; LOG_FILE="$S/t_hooks.log"; TIMEOUT_SECONDS="0"
+LOCK_FILE="\${WORK_DIR}/server-backup.lock"
 ONE_FILE_SYSTEM="no"; BACKUP_MODE="snapshot"; CAPTURE_SYSTEM_STATE="no"
 CONF
 chmod 600 "$HK/backup.conf"
@@ -408,6 +411,7 @@ INCLUDE_PATHS="
 $S/space/mon dossier/etc
 "
 WORK_DIR="$S/space/work"; LOG_FILE="$S/t_space.log"; TIMEOUT_SECONDS="0"
+LOCK_FILE="\${WORK_DIR}/server-backup.lock"
 ONE_FILE_SYSTEM="no"; CAPTURE_SYSTEM_STATE="no"; BACKUP_MODE="snapshot"
 CONF
 chmod 600 "$S/t_space.conf"
@@ -438,6 +442,7 @@ EXCLUDE_PATTERNS="
 $S/excl/srv/var/log
 "
 WORK_DIR="$S/excl/work"; LOG_FILE="$S/t_excl.log"; TIMEOUT_SECONDS="0"
+LOCK_FILE="\${WORK_DIR}/server-backup.lock"
 ONE_FILE_SYSTEM="no"; CAPTURE_SYSTEM_STATE="no"; BACKUP_MODE="snapshot"
 CONF
 chmod 600 "$S/t_excl.conf"
@@ -489,6 +494,7 @@ INCLUDE_PATHS="
 $S/tmo/srv/etc
 "
 WORK_DIR="$S/tmo/work"; LOG_FILE="$S/t_tmo.log"
+LOCK_FILE="\${WORK_DIR}/server-backup.lock"
 TIMEOUT_SECONDS="600"
 ONE_FILE_SYSTEM="no"; CAPTURE_SYSTEM_STATE="no"; BACKUP_MODE="snapshot"
 CONF
