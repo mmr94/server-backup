@@ -55,7 +55,7 @@ readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # commande via PATH. Un ${BASH_SOURCE[0]} relatif (./server-backup.sh) échoue
 # alors avec "No such file or directory".
 readonly SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 # Non readonly : acquire_lock() se replie sur WORK_DIR si /var/lock est absent.
 LOCK_FILE="/var/lock/server-backup.lock"
 
@@ -96,6 +96,10 @@ KEEP_DAILY="7" ; KEEP_WEEKLY="4" ; KEEP_MONTHLY="6" ; KEEP_YEARLY="2" ; KEEP_LOC
 WORK_DIR="/var/backups/server-backup"
 LOG_FILE="/var/log/server-backup.log"
 COMPRESSION_LEVEL="10"
+COMPRESSION_THREADS="2"
+FTP_QUOTA_BYTES="0" ; FTP_RESERVE_BYTES="10000000000"
+BACKUP_VERIFY_REMOTE="no"
+PREPARE_ONLY="no" ; EXISTING_ARCHIVE=""
 BANDWIDTH_LIMIT_KB="0"
 TIMEOUT_SECONDS="10800"
 NOTIFY_WEBHOOK="" ; NOTIFY_ON_SUCCESS="no" ; NOTIFY_EMAIL=""
@@ -1068,10 +1072,8 @@ build_archive() {
   _tar_supports --ignore-failed-read   && tar_opts+=(--ignore-failed-read)
   _tar_supports --warning              && tar_opts+=(--warning=no-file-changed)
 
-  # --one-file-system empêche de partir dans un montage réseau ou un disque de
-  # données, mais il exclut SILENCIEUSEMENT tout chemin situé sur un autre
-  # système de fichiers. Un /var/www monté sur un disque dédié disparaîtrait
-  # ainsi de la sauvegarde sans le moindre message. On prévient explicitement.
+  # Explicit include paths are archived on their own filesystem; this option
+  # prevents descending into additional mounts below each include path.
   if [[ "${ONE_FILE_SYSTEM}" == "yes" ]] && _tar_supports --one-file-system; then
     tar_opts+=(--one-file-system)
     local root_dev inc_dev inc
@@ -1080,7 +1082,7 @@ build_archive() {
       for inc in "${includes[@]}"; do
         inc_dev="$(stat -c '%d' "/${inc}" 2>/dev/null || stat -f '%d' "/${inc}" 2>/dev/null || echo '')"
         if [[ -n "${inc_dev}" && "${inc_dev}" != "${root_dev}" ]]; then
-          log_warn "/${inc} est sur un autre système de fichiers : ONE_FILE_SYSTEM=yes va l'EXCLURE. Passe ONE_FILE_SYSTEM à \"no\" pour l'inclure."
+          log_info "/${inc} est explicitement inclus sur un autre système de fichiers ; ses sous-montages ne sont pas parcourus."
         fi
       done
     fi
@@ -1107,6 +1109,11 @@ build_archive() {
       tar_opts+=(--exclude="/${pat}")
     fi
   done <<<"${EXCLUDE_PATTERNS}"
+
+  # The hook replaces live SQLite files with consistent online snapshots.
+  if [[ -f "${STAGING_DIR}/_sqlite/exclude-live.txt" ]]; then
+    tar_opts+=(--exclude-from="${STAGING_DIR}/_sqlite/exclude-live.txt")
+  fi
 
   # --- Exclusion des secrets ---
   # C'est la protection principale de l'archive : appliquée APRÈS les
@@ -1153,7 +1160,7 @@ build_archive() {
   # --- Compression ---
   local -a comp_cmd
   case "${COMPRESSOR}" in
-    zstd) comp_cmd=(zstd "-${COMPRESSION_LEVEL}" -T0 -q -c) ;;
+    zstd) comp_cmd=(zstd "-${COMPRESSION_LEVEL}" "-T${COMPRESSION_THREADS}" -q -c) ;;
     pigz) comp_cmd=(pigz "-${COMPRESSION_LEVEL}" -c) ;;
     gzip) comp_cmd=(gzip "-${COMPRESSION_LEVEL}" -c) ;;
   esac
@@ -1314,6 +1321,23 @@ verify_archive() {
   fi
 
   log_ok "Archive vérifiée : ${count} entrées, tous les chemins sources présents."
+}
+
+# ============================================================================
+#  Capacité et vérification distante
+# ============================================================================
+check_ftp_capacity() {
+  [[ "${DRY_RUN}" == "yes" || "${FTP_QUOTA_BYTES}" == "0" ]] && return 0
+  log_step "Contrôle capacité FTP (quota, marge, rétention et envoi avant rotation)"
+  python3 "${SCRIPT_DIR}/backup_ftp.py" capacity --config "${CONFIG_FILE}" \
+    --archive "${ARCHIVE_PATH}" || die "Capacité FTP insuffisante : aucun envoi ni suppression." 4
+}
+
+verify_remote_upload() {
+  [[ "${DRY_RUN}" == "yes" || "${BACKUP_VERIFY_REMOTE}" != "yes" ]] && return 0
+  log_step "Relecture intégrale de la sauvegarde distante et contrôle SHA-256"
+  python3 "${SCRIPT_DIR}/backup_ftp.py" verify --config "${CONFIG_FILE}" \
+    --archive "${ARCHIVE_PATH}" || die "Archive distante non validée : rotation annulée." 4
 }
 
 # ============================================================================
@@ -1605,6 +1629,9 @@ rotate_remote() {
       monthly) (( kept_monthly < KEEP_MONTHLY )) && { kept_monthly=$(( kept_monthly + 1 )); keep="yes"; } ;;
       yearly)  (( kept_yearly  < KEEP_YEARLY  )) && { kept_yearly=$((  kept_yearly  + 1 )); keep="yes"; } ;;
     esac
+    # Always preserve the newest successful backup, including January 1 when
+    # yearly retention is zero. Capacity accounting reserves this extra slot.
+    [[ "${a}" == "${sorted[0]}" ]] && keep="yes"
     [[ "${keep}" == "no" ]] && to_delete+=("${a}")
   done
 
@@ -1867,7 +1894,7 @@ MAILTO=""
 # La sortie va dans le log du script plutot que dans /dev/null : sans cela,
 # un echec ne laisserait aucune trace exploitable si NOTIFY_WEBHOOK n'est pas
 # configure. Le script fait tourner ce fichier au-dela de 5 Mo.
-17 3 * * * root ${script_path} >>${LOG_FILE} 2>&1
+17 3 * * * root nice -n 10 ionice -c2 -n7 ${script_path} >>${LOG_FILE} 2>&1
 EOF
   chmod 644 "${target}"
   log_ok "Cron installé : ${target}"
@@ -1919,7 +1946,13 @@ do_backup() {
   build_archive
   verify_archive
   scan_archive_for_secrets
+  if [[ "${PREPARE_ONLY}" == "yes" ]]; then
+    log_ok "Archive préparée et vérifiée : ${ARCHIVE_PATH}. Aucun envoi ni rotation."
+    return 0
+  fi
+  check_ftp_capacity
   upload_archive
+  verify_remote_upload
   rotate_remote
   rotate_local
 
@@ -1958,6 +1991,8 @@ usage() {
 OPTIONS
   --config <fichier>     Chemin du fichier de configuration
   --dry-run              Simule sans créer ni envoyer d'archive
+  --prepare-only         Prépare et vérifie une archive sans envoi ni rotation
+  --upload-existing <f>  Envoie une archive préparée, la vérifie puis fait tourner
   --check                Vérifie prérequis, configuration et connexion FTP
   --list                 Liste les archives présentes sur le FTP
   --restore <archive>    Télécharge une archive (sans extraction)
@@ -2010,11 +2045,35 @@ CODES DE SORTIE
 EOF
 }
 
+do_upload_existing() {
+  check_prerequisites
+  validate_config
+  acquire_lock
+  [[ -f "${EXISTING_ARCHIVE}" && ! -L "${EXISTING_ARCHIVE}" ]] || die "Archive préparée absente ou lien symbolique." 3
+  [[ "$(dirname "${EXISTING_ARCHIVE}")" == "${WORK_DIR}" ]] || die "Archive hors du dossier de sauvegarde." 3
+  [[ "$(basename "${EXISTING_ARCHIVE}")" == "${SERVER_NAME}_"* ]] || die "Archive d'un autre serveur." 3
+  case "${EXISTING_ARCHIVE}" in
+    *.tar.zst|*.tar.gz) ;;
+    *) die "Archive non chiffrée .tar.zst ou .tar.gz attendue." 3 ;;
+  esac
+  [[ -f "${EXISTING_ARCHIVE}.sha256" ]] || die "Empreinte de l'archive préparée absente." 3
+  [[ "$(sha256sum "${EXISTING_ARCHIVE}" | awk '{print $1}')" == "$(cat "${EXISTING_ARCHIVE}.sha256")" ]] || die "Archive préparée modifiée ou corrompue." 3
+  ARCHIVE_PATH="${EXISTING_ARCHIVE}"
+  check_ftp_capacity
+  upload_archive
+  verify_remote_upload
+  rotate_remote
+  rotate_local
+  log_ok "Sauvegarde préparée envoyée et relue intégralement : $(basename "${ARCHIVE_PATH}")"
+}
+
 main() {
   while (( $# > 0 )); do
     case "$1" in
       --config)        CONFIG_FILE="${2:?--config attend un chemin}" ; shift 2 ;;
       --dry-run)       DRY_RUN="yes" ; shift ;;
+      --prepare-only)  PREPARE_ONLY="yes" ; shift ;;
+      --upload-existing) MODE="upload-existing" ; EXISTING_ARCHIVE="${2:?archive attendue}" ; shift 2 ;;
       --check)         MODE="check" ; shift ;;
       --list)          MODE="list" ; shift ;;
       --restore)       MODE="restore" ; RESTORE_TARGET="${2:?--restore attend un nom darchive}" ; shift 2 ;;
@@ -2058,6 +2117,7 @@ main() {
     local -a relaunch=("${SCRIPT_PATH}")
     [[ -n "${CONFIG_FILE}" ]] && relaunch+=(--config "${CONFIG_FILE}")
     [[ "${DRY_RUN}" == "yes" ]] && relaunch+=(--dry-run)
+    [[ "${PREPARE_ONLY}" == "yes" ]] && relaunch+=(--prepare-only)
 
     exec timeout --foreground --signal=TERM --kill-after=60 "${TIMEOUT_SECONDS}" \
       "${relaunch[@]}"
@@ -2065,6 +2125,7 @@ main() {
 
   case "${MODE}" in
     backup)       do_backup ;;
+    upload-existing) do_upload_existing ;;
     check)        do_check ;;
     list)         do_list ;;
     restore)      do_restore ;;
