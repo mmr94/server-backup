@@ -324,6 +324,9 @@ $SRV/etc
 "
 WORK_DIR="$SRV/work"; LOG_FILE="$S/t_hooks.log"; TIMEOUT_SECONDS="0"
 LOCK_FILE="\${WORK_DIR}/server-backup.lock"
+# These fixtures live under tmp; production's default /tmp exclusion would
+# exclude the test source itself. Only test the hook behaviour here.
+EXCLUDE_PATTERNS=""
 ONE_FILE_SYSTEM="no"; BACKUP_MODE="snapshot"; CAPTURE_SYSTEM_STATE="no"
 CONF
 chmod 600 "$HK/backup.conf"
@@ -412,6 +415,7 @@ $S/space/mon dossier/etc
 "
 WORK_DIR="$S/space/work"; LOG_FILE="$S/t_space.log"; TIMEOUT_SECONDS="0"
 LOCK_FILE="\${WORK_DIR}/server-backup.lock"
+EXCLUDE_PATTERNS=""
 ONE_FILE_SYSTEM="no"; CAPTURE_SYSTEM_STATE="no"; BACKUP_MODE="snapshot"
 CONF
 chmod 600 "$S/t_space.conf"
@@ -495,6 +499,7 @@ $S/tmo/srv/etc
 "
 WORK_DIR="$S/tmo/work"; LOG_FILE="$S/t_tmo.log"
 LOCK_FILE="\${WORK_DIR}/server-backup.lock"
+EXCLUDE_PATTERNS=""
 TIMEOUT_SECONDS="600"
 ONE_FILE_SYSTEM="no"; CAPTURE_SYSTEM_STATE="no"; BACKUP_MODE="snapshot"
 CONF
