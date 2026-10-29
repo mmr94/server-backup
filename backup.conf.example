@@ -33,6 +33,14 @@ FTP_PROTOCOL="ftps"
 # certificat auto-signé et que tu acceptes le risque de MITM.
 FTP_VERIFY_CERT="yes"
 
+# Quota du compte entier, en octets (0 = contrôle désactivé).
+# Exemple Dedibackup 100 Go : FTP_QUOTA_BYTES="100000000000".
+# La dernière sauvegarde distante vérifiée reste protégée lors des purges.
+# Contrôles de capacité disponibles en FTP / FTPS explicite, avec python3.
+FTP_QUOTA_BYTES="0"
+FTP_RESERVE_BYTES="10000000000"
+BACKUP_VERIFY_REMOTE="no"
+
 # Clé privée SSH pour le mode sftp (laisser vide pour utiliser FTP_PASS)
 SFTP_KEY=""
 

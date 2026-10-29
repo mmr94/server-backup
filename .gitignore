@@ -43,3 +43,4 @@ restore/
 Thumbs.db
 *~
 *.swp
+__pycache__/

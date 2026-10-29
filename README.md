@@ -132,6 +132,9 @@ Le script cherche sa configuration dans cet ordre :
 | `BACKUP_MODE` | `snapshot` (une archive) ou `history` (rotation) |
 | `HOOK_FAILURE` | `abort` (défaut) ou `warn` si `before_backup.sh` échoue |
 | `MAX_FILE_SIZE_MB` | Filet contre un dump de 40 Go oublié dans `/var/www` |
+| `FTP_QUOTA_BYTES` | Quota réel du compte FTP/FTPS en octets ; `0` désactive le contrôle |
+| `FTP_RESERVE_BYTES` | Marge libre conservée dans le quota, 10 Go par défaut |
+| `BACKUP_VERIFY_REMOTE` | `yes` relit intégralement l'archive distante avant toute rotation |
 
 Un même fichier de configuration convient à plusieurs serveurs : les chemins inexistants sont signalés puis ignorés, jamais fatals.
 
@@ -255,10 +258,31 @@ Le script contrôle son propre travail avant de considérer une sauvegarde réus
 - **Un timeout global** évite qu'une sauvegarde bloquée tourne jusqu'au cron suivant.
 - Les fichiers temporaires sont effacés en sortie, y compris après une erreur ou une interruption.
 
+### Quota FTP et reprise après échec
+
+Avec `FTP_QUOTA_BYTES` non nul, le contrôle utilise l'occupation **réelle du compte entier**, l'archive entrante et la réserve. Une projection de croissance ou un nombre théorique de rétentions ne bloque plus une sauvegarde qui tient déjà dans le quota.
+
+L'envoi précède la rotation dès que la place le permet. Si la place manque réellement, le script prépare un plan minimal de suppression des archives datées les plus anciennes, limité au dossier de ce serveur. Avant la première suppression, il contrôle le SHA-256 de l'archive locale et relit intégralement la dernière archive distante pour vérifier son empreinte. Cette dernière copie, les archives `latest`, les fichiers inconnus et les autres serveurs restent protégés. Si leur conservation ne laisse pas assez de place, aucune archive n'est supprimée.
+
+Avec `BACKUP_VERIFY_REMOTE="yes"`, un échec d'envoi ou de vérification empêche la rotation distante. Un reçu privé `.last-verified.json` permet de borner les copies locales en attente : conserver la plus récente prête à envoyer et la dernière vérifiée sur ce même compte FTP. Sans reçu, toutes les copies locales sont conservées. Après succès, `KEEP_LOCAL` s'applique normalement.
+
+Une archive déjà préparée peut être reprise sans recréer de dump ni refaire la compression :
+
+```bash
+./server-backup.sh --config /etc/server-backup/backup.conf --upload-existing /var/backups/server-backup/serveur_2026-10-28_031700.tar.zst
+```
+
+Le fichier doit rester dans `WORK_DIR` avec son empreinte `.sha256` valide. Cette commande vérifie le fichier local, l'envoie, le relit sur le FTP, puis applique la rotation. Les adaptations propres à une machine, les hooks et les identifiants restent hors Git.
+
+Le commit `319a987` conserve exactement les trois fichiers de code déployés sur Core avant la correction de quota (version 1.1.0). Pour revenir en arrière, préparer un revert du correctif dans le dépôt local, le committer, le pousser puis le récupérer sur le serveur. Conserver `backup.conf`, les hooks, le répertoire `WORK_DIR` et les données des services ; un retour arrière de code ne restaure pas d'anciennes données. La version 1.1.0 réintroduit l'ancien contrôle pessimiste : ne pas considérer ses cycles FTP comme rétablis.
+
 ### Tests
 
 ```bash
 ./tests-run.sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v test_backup_ftp.py
+# Avec pyftpdlib installé dans l'environnement de test :
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v test_backup_ftp_integration.py
 ```
 
 68 tests couvrant le sens unique du transfert, le contenu des archives, les deux modes de gestion des secrets, la détection des sauvegardes incomplètes, les deux stratégies de rétention, la robustesse (FTP injoignable, config invalide, exécution concurrente, interruption en plein travail), l'intégrité SHA-256 et la non-exposition des identifiants.

@@ -55,7 +55,7 @@ readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # commande via PATH. Un ${BASH_SOURCE[0]} relatif (./server-backup.sh) échoue
 # alors avec "No such file or directory".
 readonly SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.2.0"
 # Non readonly : acquire_lock() se replie sur WORK_DIR si /var/lock est absent.
 LOCK_FILE="/var/lock/server-backup.lock"
 
@@ -196,6 +196,7 @@ RESTORE_TARGET=""
 CONFIG_FILE=""
 STAGING_DIR=""
 ARCHIVE_PATH=""
+LOCAL_ARCHIVE_VERIFIED="no"
 LOCK_STYLE=""
 LOCK_DIR=""
 LOG_WRITABLE="unknown"
@@ -272,6 +273,13 @@ cleanup() {
   [[ -n "${NETRC_FILE:-}" && -f "${NETRC_FILE}" ]] && rm -f -- "${NETRC_FILE}"
   if [[ -n "${STAGING_DIR}" && -d "${STAGING_DIR}" ]]; then
     rm -rf -- "${STAGING_DIR}"
+  fi
+  # An upload failure must not accumulate one large archive every night.
+  # Keep the newest locally verified archive and the last remotely verified
+  # copy. Without a verification receipt the helper deletes nothing.
+  if (( exit_code != 0 )) && [[ "${LOCAL_ARCHIVE_VERIFIED}" == "yes" && "${BACKUP_VERIFY_REMOTE}" == "yes" && "${DRY_RUN}" != "yes" ]]; then
+    python3 "${SCRIPT_DIR}/backup_ftp.py" trim-local --config "${CONFIG_FILE}" \
+      --archive "${ARCHIVE_PATH}" || log_warn "Nettoyage des anciennes archives en attente différé : copies conservées."
   fi
   # Libère le verrou selon le mécanisme réellement utilisé. Sans ça, un verrou
   # par répertoire survivrait à la sortie et bloquerait le cron suivant.
@@ -463,6 +471,10 @@ check_prerequisites() {
     [[ "${FTP_PROTOCOL}" == "sftp" ]] && { log_error "Le mode sftp nécessite lftp."; missing=$((missing+1)); }
   else
     log_error "Ni 'lftp' ni 'curl' n'est installé — impossible d'uploader."; missing=$((missing+1))
+  fi
+
+  if [[ "${FTP_QUOTA_BYTES}" != "0" || "${BACKUP_VERIFY_REMOTE}" == "yes" ]]; then
+    have python3 || { log_error "python3 est requis pour les contrôles FTP."; missing=$((missing+1)); }
   fi
 
   if (( missing > 0 )); then
@@ -1328,9 +1340,9 @@ verify_archive() {
 # ============================================================================
 check_ftp_capacity() {
   [[ "${DRY_RUN}" == "yes" || "${FTP_QUOTA_BYTES}" == "0" ]] && return 0
-  log_step "Contrôle capacité FTP (quota, marge, rétention et envoi avant rotation)"
-  python3 "${SCRIPT_DIR}/backup_ftp.py" capacity --config "${CONFIG_FILE}" \
-    --archive "${ARCHIVE_PATH}" || die "Capacité FTP insuffisante : aucun envoi ni suppression." 4
+  log_step "Capacité FTP réelle : envoi d'abord, purge minimale si nécessaire avec dernière copie vérifiée protégée"
+  python3 "${SCRIPT_DIR}/backup_ftp.py" make-room --config "${CONFIG_FILE}" \
+    --archive "${ARCHIVE_PATH}" || die "Envoi annulé : dernière sauvegarde distante conservée ; vérifier capacité et intégrité." 4
 }
 
 verify_remote_upload() {
@@ -1667,7 +1679,7 @@ rotate_remote() {
 rotate_local() {
   [[ "${DRY_RUN}" == "yes" ]] && return 0
   local -a locals=()
-  mapfile -t locals < <(find "${WORK_DIR}" -maxdepth 1 -name "${SERVER_NAME}_*" ! -name '*.sha256' -type f 2>/dev/null | sort -r)
+  mapfile -t locals < <(find "${WORK_DIR}" -maxdepth 1 -name "${SERVER_NAME}_*" \( -name '*.tar.zst' -o -name '*.tar.gz' \) -type f 2>/dev/null | sort -r)
   local i
   for (( i = KEEP_LOCAL; i < ${#locals[@]}; i++ )); do
     rm -f -- "${locals[i]}" "${locals[i]}.sha256"
@@ -1946,6 +1958,7 @@ do_backup() {
   build_archive
   verify_archive
   scan_archive_for_secrets
+  LOCAL_ARCHIVE_VERIFIED="yes"
   if [[ "${PREPARE_ONLY}" == "yes" ]]; then
     log_ok "Archive préparée et vérifiée : ${ARCHIVE_PATH}. Aucun envoi ni rotation."
     return 0
@@ -2059,6 +2072,7 @@ do_upload_existing() {
   [[ -f "${EXISTING_ARCHIVE}.sha256" ]] || die "Empreinte de l'archive préparée absente." 3
   [[ "$(sha256sum "${EXISTING_ARCHIVE}" | awk '{print $1}')" == "$(cat "${EXISTING_ARCHIVE}.sha256")" ]] || die "Archive préparée modifiée ou corrompue." 3
   ARCHIVE_PATH="${EXISTING_ARCHIVE}"
+  LOCAL_ARCHIVE_VERIFIED="yes"
   check_ftp_capacity
   upload_archive
   verify_remote_upload
